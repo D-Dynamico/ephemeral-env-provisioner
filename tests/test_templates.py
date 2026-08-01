@@ -5,13 +5,18 @@ These are pure functions, so they get real coverage despite §8 — no daemon
 involved. The rest of DockerManager still does not.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 
+from config import settings
 from docker_manager.compose import (
     TEMPLATES,
+    DockerManager,
     container_name,
     network_name,
     resolve_environment,
+    to_docker_healthcheck,
 )
 
 ENV_ID = "7eb66d91-b31d-4e8c-9d66-88ec645e25b6"
@@ -103,3 +108,105 @@ def test_every_template_resolves_cleanly():
                 resolve_environment(ENV_ID, spec, roles)
             except ValueError as exc:
                 pytest.fail(f"template {name!r}, role {spec['role']!r}: {exc}")
+
+
+def test_db_role_has_a_healthcheck():
+    """
+    Anything that connects to Postgres on boot depends on this. Without it the
+    app races the database and the failure is intermittent.
+    """
+    db = next(s for s in TEMPLATES["webapp-postgres"] if s["role"] == "db")
+    assert db["healthcheck"]["test"][0] == "CMD-SHELL"
+    assert "pg_isready" in db["healthcheck"]["test"][1]
+
+
+# ── Healthcheck translation ────────────────────────────────────────────────────
+
+def test_seconds_become_nanoseconds():
+    """Templates are written in seconds; Docker's API wants nanoseconds."""
+    hc = to_docker_healthcheck({
+        "test": ["CMD-SHELL", "true"],
+        "interval_seconds": 2,
+        "timeout_seconds": 3,
+        "start_period_seconds": 1,
+        "retries": 15,
+    })
+
+    assert hc == {
+        "test": ["CMD-SHELL", "true"],
+        "interval": 2_000_000_000,
+        "timeout": 3_000_000_000,
+        "start_period": 1_000_000_000,
+        "retries": 15,
+    }
+
+
+def test_optional_healthcheck_fields_are_omitted():
+    """Docker applies its own defaults; sending zeros would override them."""
+    assert to_docker_healthcheck({"test": ["CMD", "true"]}) == {"test": ["CMD", "true"]}
+
+
+def test_shipped_healthchecks_translate():
+    for template in TEMPLATES.values():
+        for spec in template:
+            if spec.get("healthcheck"):
+                assert "test" in to_docker_healthcheck(spec["healthcheck"])
+
+
+# ── Readiness ──────────────────────────────────────────────────────────────────
+
+def _container(status="running", health=None):
+    c = MagicMock()
+    c.status = status
+    c.short_id = "abc123"
+    c.attrs = {"State": {"Health": {"Status": health}} if health else {}}
+    c.reload = MagicMock()
+    return c
+
+
+def test_ready_when_healthcheck_passes():
+    mgr = DockerManager()
+    spec = {"role": "db", "healthcheck": {"test": ["CMD", "true"]}}
+
+    mgr._wait_for_ready(_container(health="healthy"), spec, timeout=5)  # must not raise
+
+
+def test_running_is_not_ready_when_a_healthcheck_exists():
+    """
+    The bug this replaces: `running` was treated as ready, so a dependant
+    booted while Postgres was still starting.
+    """
+    mgr = DockerManager()
+    spec = {"role": "db", "healthcheck": {"test": ["CMD", "true"]}}
+
+    with pytest.raises(TimeoutError):
+        mgr._wait_for_ready(_container(health="starting"), spec, timeout=1)
+
+
+def test_running_is_ready_without_a_healthcheck():
+    """No healthcheck means `running` is the best signal available."""
+    mgr = DockerManager()
+
+    mgr._wait_for_ready(_container(), {"role": "app"}, timeout=5)  # must not raise
+
+
+def test_unhealthy_fails_fast():
+    mgr = DockerManager()
+    spec = {"role": "db", "healthcheck": {"test": ["CMD", "true"]}}
+
+    with pytest.raises(RuntimeError, match="failed its healthcheck"):
+        mgr._wait_for_ready(_container(health="unhealthy"), spec, timeout=30)
+
+
+def test_exited_container_fails_fast():
+    mgr = DockerManager()
+
+    with pytest.raises(RuntimeError, match="died during startup"):
+        mgr._wait_for_ready(_container(status="exited"), {"role": "app"}, timeout=30)
+
+
+def test_ready_timeout_defaults_to_the_setting():
+    assert settings.container_ready_timeout_seconds < settings.provisioning_timeout_seconds, (
+        "a container wait longer than the staleness timeout would let the sweep "
+        "fail the row while the worker is still working on it"
+    )

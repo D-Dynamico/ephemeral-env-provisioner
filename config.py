@@ -42,6 +42,10 @@ class Settings(BaseSettings):
 
     # Environments
     default_ttl_seconds: int = 7200
+    # How long one container may take to become ready before the provision is
+    # treated as failed. Must stay well under provisioning_timeout_seconds, or
+    # the staleness sweep fails the row while the worker is still waiting.
+    container_ready_timeout_seconds: int = 120
     max_environments_per_user: int = 5
     base_port: int = 20000
 
