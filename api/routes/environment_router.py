@@ -1,6 +1,3 @@
-"""
-Environment routes — CRUD + async provisioning via Celery.
-"""
 
 import uuid
 from typing import Optional
