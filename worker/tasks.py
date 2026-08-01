@@ -48,6 +48,10 @@ celery_app.conf.beat_schedule = {
         "task": "worker.tasks.reconcile_orphans",
         "schedule": float(settings.orphan_sweep_interval_seconds),
     },
+    "recover-stale": {
+        "task": "worker.tasks.recover_stale_transitions",
+        "schedule": float(settings.stale_sweep_interval_seconds),
+    },
 }
 
 # ── Sync DB session for Celery (sync SQLAlchemy, not async) ───────────────────
@@ -81,7 +85,7 @@ def _mark_failed(db: Session, env_id: str, message: str) -> None:
         db.rollback()
         env = _load_env(db, env_id)
         if env:
-            env.status = EnvironmentStatus.FAILED
+            env.set_status(EnvironmentStatus.FAILED)
             env.error_message = message[:500]
             db.commit()
     except Exception:
@@ -103,7 +107,7 @@ def provision_environment(self, env_id: str) -> dict:
             raise ValueError(f"Environment {env_id} not found")
 
         # ── Transition: pending → provisioning ─────────────────────────────
-        env.status = EnvironmentStatus.PROVISIONING
+        env.set_status(EnvironmentStatus.PROVISIONING)
         db.commit()
         log.info("[%s] Starting provisioning (template=%s)", env_id, env.template)
 
@@ -115,7 +119,7 @@ def provision_environment(self, env_id: str) -> dict:
 
         # ── Transition: provisioning → running ─────────────────────────────
         now = datetime.now(timezone.utc)
-        env.status = EnvironmentStatus.RUNNING
+        env.set_status(EnvironmentStatus.RUNNING)
         env.network_id = result.network_id
         env.container_ids = result.container_ids
         env.host_port = result.host_port
@@ -158,7 +162,7 @@ def teardown_environment(self, env_id: str) -> dict:
             raise ValueError(f"Environment {env_id} not found")
 
         # ── Transition: running → stopping ─────────────────────────────────
-        env.status = EnvironmentStatus.STOPPING
+        env.set_status(EnvironmentStatus.STOPPING)
         db.commit()
         log.info("[%s] Starting teardown", env_id)
 
@@ -169,7 +173,7 @@ def teardown_environment(self, env_id: str) -> dict:
         )
 
         # ── Transition: stopping → stopped ─────────────────────────────────
-        env.status = EnvironmentStatus.STOPPED
+        env.set_status(EnvironmentStatus.STOPPED)
         env.stopped_at = datetime.now(timezone.utc)
         db.commit()
 
@@ -212,7 +216,7 @@ def reap_expired_environments() -> dict:
             return {"reaped": 0}
 
         for env in expired:
-            env.status = EnvironmentStatus.STOPPING
+            env.set_status(EnvironmentStatus.STOPPING)
         db.commit()
 
         for env in expired:
@@ -280,6 +284,64 @@ def reconcile_orphans() -> dict:
             removed += 1
 
         return {"removed": removed, "skipped": skipped}
+
+    finally:
+        db.close()
+
+
+# Every transient state and how long a row may sit in it before it is presumed
+# dead. A worker that raises moves its own row; a worker that is *killed* leaves
+# nothing behind to do it, and only this sweep can free the row (invariant 5).
+TRANSIENT_TIMEOUTS = {
+    EnvironmentStatus.PENDING: settings.pending_timeout_seconds,
+    EnvironmentStatus.PROVISIONING: settings.provisioning_timeout_seconds,
+    EnvironmentStatus.STOPPING: settings.stopping_timeout_seconds,
+}
+
+
+@celery_app.task
+def recover_stale_transitions() -> dict:
+    """
+    Free rows stranded in a transient state by a worker that died.
+
+    All three transient states resolve to FAILED rather than being retried.
+    FAILED is terminal, which hands any Docker resources the row still owns to
+    `reconcile_orphans` — the two sweeps compose, and neither can loop.
+
+    Rows with a NULL `status_changed_at` are never swept. The column was added
+    after these rows existed, and treating unknown as infinitely stale would
+    fail live environments.
+    """
+    db = get_sync_db()
+    try:
+        now = datetime.now(timezone.utc)
+        recovered: dict[str, int] = {}
+
+        for status, timeout in TRANSIENT_TIMEOUTS.items():
+            cutoff = now - timedelta(seconds=timeout)
+            stale = db.query(Environment).filter(
+                Environment.status == status,
+                Environment.status_changed_at.isnot(None),
+                Environment.status_changed_at <= cutoff,
+            ).all()
+
+            for env in stale:
+                log.warning(
+                    "[%s] Stuck in %s for over %ds — presuming the worker died",
+                    env.id, status.value, timeout,
+                )
+                env.set_status(EnvironmentStatus.FAILED)
+                env.error_message = (
+                    f"Presumed dead: stuck in {status.value} for over {timeout}s"
+                )[:500]
+
+            if stale:
+                recovered[status.value] = len(stale)
+
+        if recovered:
+            db.commit()
+
+        return {"recovered": recovered, "total": sum(recovered.values())}
 
     finally:
         db.close()

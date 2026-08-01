@@ -66,5 +66,16 @@ class Environment(Base):
     # Celery task tracking
     celery_task_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
+    def set_status(self, new_status: EnvironmentStatus) -> None:
+        """
+        The only place a status transition happens (CLAUDE.md §5).
+
+        Assigning `status` directly is a bug: the staleness sweeps key off
+        `status_changed_at`, so a transition that forgets to bump it leaves the
+        row looking permanently stuck at its previous state.
+        """
+        self.status = new_status
+        self.status_changed_at = datetime.now(timezone.utc)
+
     def __repr__(self) -> str:
         return f"<Environment id={self.id} name={self.name} status={self.status}>"
