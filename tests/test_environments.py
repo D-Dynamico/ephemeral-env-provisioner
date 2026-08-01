@@ -215,6 +215,35 @@ async def test_reaper_tears_down_only_expired(sync_sessions):
     check.close()
 
 
+async def test_teardown_marks_failed_when_retries_exhausted(sync_sessions):
+    """A teardown that exhausts its retries must not leave the row in STOPPING."""
+    session = sync_sessions()
+    env = make_env("doomed-env", datetime.now(timezone.utc) - timedelta(minutes=5))
+    session.add(env)
+    session.commit()
+    env_id = env.id
+    session.close()
+
+    boom = RuntimeError("docker daemon unreachable")
+    task = worker_tasks.teardown_environment
+    # push_request simulates the final attempt. Call .run() rather than the task
+    # itself: Task.__call__ pushes its own request, which would reset retries to 0.
+    task.push_request(retries=task.max_retries)
+    try:
+        with patch.object(worker_tasks, "get_sync_db", lambda: sync_sessions()), \
+             patch.object(worker_tasks.docker_manager, "teardown", side_effect=boom), \
+             pytest.raises(RuntimeError):
+            task.run(str(env_id))
+    finally:
+        task.pop_request()
+
+    check = sync_sessions()
+    row = check.get(Environment, env_id)
+    assert row.status == EnvironmentStatus.FAILED
+    assert "docker daemon unreachable" in row.error_message
+    check.close()
+
+
 async def test_reaper_ignores_non_running(sync_sessions):
     """An already-stopping env must not be enqueued twice."""
     past = datetime.now(timezone.utc) - timedelta(minutes=5)

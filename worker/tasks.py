@@ -6,6 +6,7 @@ Run with:
 """
 
 import logging
+import uuid
 from datetime import datetime, timezone, timedelta
 
 from celery import Celery
@@ -58,6 +59,31 @@ def get_sync_db() -> Session:
     return SyncSession()
 
 
+def _load_env(db: Session, env_id: str) -> Environment | None:
+    """
+    Tasks receive env_id as a string (Celery serialises to JSON). The column is
+    Uuid(as_uuid=True), whose bind processor calls .hex — so a raw string works
+    on PostgreSQL but raises on SQLite. Coerce once, here.
+    """
+    return db.query(Environment).filter_by(id=uuid.UUID(str(env_id))).first()
+
+
+def _mark_failed(db: Session, env_id: str, message: str) -> None:
+    """
+    Best-effort terminal marker. Never raises, so it is safe to call from an
+    except block where the session may already be in a broken transaction.
+    """
+    try:
+        db.rollback()
+        env = _load_env(db, env_id)
+        if env:
+            env.status = EnvironmentStatus.FAILED
+            env.error_message = message[:500]
+            db.commit()
+    except Exception:
+        log.exception("[%s] Could not mark environment FAILED", env_id)
+
+
 # ── Tasks ──────────────────────────────────────────────────────────────────────
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=10)
@@ -68,7 +94,7 @@ def provision_environment(self, env_id: str) -> dict:
     """
     db = get_sync_db()
     try:
-        env: Environment = db.query(Environment).filter_by(id=env_id).first()
+        env: Environment = _load_env(db, env_id)
         if not env:
             raise ValueError(f"Environment {env_id} not found")
 
@@ -105,13 +131,7 @@ def provision_environment(self, env_id: str) -> dict:
 
     except Exception as exc:
         log.exception("[%s] Provisioning failed: %s", env_id, exc)
-        # Mark as failed in DB
-        try:
-            env.status = EnvironmentStatus.FAILED
-            env.error_message = str(exc)[:500]
-            db.commit()
-        except Exception:
-            pass
+        _mark_failed(db, env_id, str(exc))
 
         # Retry with exponential backoff unless it's a value error
         if not isinstance(exc, ValueError):
@@ -129,7 +149,7 @@ def teardown_environment(self, env_id: str) -> dict:
     """
     db = get_sync_db()
     try:
-        env: Environment = db.query(Environment).filter_by(id=env_id).first()
+        env: Environment = _load_env(db, env_id)
         if not env:
             raise ValueError(f"Environment {env_id} not found")
 
@@ -154,6 +174,13 @@ def teardown_environment(self, env_id: str) -> dict:
 
     except Exception as exc:
         log.exception("[%s] Teardown failed: %s", env_id, exc)
+        # self.retry() raises out of this block, so the exhaustion check has to
+        # happen before the call — it cannot be caught by the same try.
+        if self.request.retries >= self.max_retries:
+            # Last attempt. Without this the row sits in STOPPING forever with
+            # no task left to move it, and the reaper only scans RUNNING.
+            _mark_failed(db, env_id, f"Teardown failed: {exc}")
+            raise
         raise self.retry(exc=exc)
 
     finally:
