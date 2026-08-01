@@ -34,5 +34,12 @@ class Settings(BaseSettings):
     max_environments_per_user: int = 5
     base_port: int = 20000
 
+    # Reconciliation
+    reap_interval_seconds: int = 60
+    orphan_sweep_interval_seconds: int = 300
+    # Docker resources younger than this are never swept, so a stack still
+    # being provisioned is not removed out from under its worker.
+    orphan_grace_seconds: int = 900
+
 
 settings = Settings()

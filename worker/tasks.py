@@ -38,11 +38,15 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1, # One task at a time per worker process
 )
 
-# Periodic sweep for expired environments — requires `celery -A worker.tasks beat`.
+# Periodic sweeps — require `celery -A worker.tasks beat`.
 celery_app.conf.beat_schedule = {
     "reap-expired": {
         "task": "worker.tasks.reap_expired_environments",
-        "schedule": 60.0,
+        "schedule": float(settings.reap_interval_seconds),
+    },
+    "reconcile-orphans": {
+        "task": "worker.tasks.reconcile_orphans",
+        "schedule": float(settings.orphan_sweep_interval_seconds),
     },
 }
 
@@ -216,6 +220,66 @@ def reap_expired_environments() -> dict:
             log.info("[%s] TTL expired — teardown enqueued", env.id)
 
         return {"reaped": len(expired)}
+
+    finally:
+        db.close()
+
+
+# Statuses where no Docker resources should exist any more. A row in any other
+# status is either in flight or legitimately running, so its resources are left
+# alone regardless of what the sweep finds.
+TERMINAL_STATUSES = frozenset(
+    {EnvironmentStatus.STOPPED, EnvironmentStatus.FAILED}
+)
+
+
+@celery_app.task
+def reconcile_orphans() -> dict:
+    """
+    Reconcile actual Docker state against intended DB state.
+
+    Docker is the source of truth for what exists, Postgres for what should
+    exist (invariant 3). They drift: `provision_environment` persists
+    `container_ids` / `network_id` only on success, so a provision that dies
+    part-way leaves resources with no DB record and no other way to find them.
+
+    Removes labelled resources whose environment row is missing or terminal.
+    Anything younger than the grace period is skipped, so this can never race a
+    worker that is still building a stack.
+    """
+    db = get_sync_db()
+    try:
+        found = docker_manager.find_labelled(
+            min_age_seconds=settings.orphan_grace_seconds
+        )
+        removed, skipped = 0, 0
+
+        for env_id, res in found.items():
+            try:
+                env = _load_env(db, env_id)
+            except (ValueError, AttributeError):
+                # Label is not a UUID — not ours to reason about. Leave it.
+                log.warning("Skipping unparseable env_id label: %r", env_id)
+                skipped += 1
+                continue
+
+            if env is not None and env.status not in TERMINAL_STATUSES:
+                skipped += 1
+                continue
+
+            reason = "no DB row" if env is None else f"status={env.status.value}"
+            log.info(
+                "[%s] Orphaned resources (%s): %d container(s), %d network(s)",
+                env_id, reason, len(res.container_ids), len(res.network_ids),
+            )
+            docker_manager.remove_resources(
+                env_id=env_id,
+                container_ids=res.container_ids,
+                network_ids=res.network_ids,
+            )
+            removed += 1
+
+        return {"removed": removed, "skipped": skipped}
 
     finally:
         db.close()

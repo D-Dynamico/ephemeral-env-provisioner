@@ -19,6 +19,7 @@ from db.models import Base, Environment, EnvironmentStatus
 from db.session import get_db
 from api.main import app
 import worker.tasks as worker_tasks
+from docker_manager.compose import DockerManager, LabelledResources, LABEL_ENV_ID
 
 # ── Test DB (SQLite in-memory) ─────────────────────────────────────────────────
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
@@ -258,3 +259,156 @@ async def test_reaper_ignores_non_running(sync_sessions):
 
     assert result == {"reaped": 0}
     mock_delay.assert_not_called()
+
+# ── Orphan sweep tests ─────────────────────────────────────────────────────────
+
+def _docker_ts(dt: datetime) -> str:
+    """Docker reports RFC3339 with nanosecond precision."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
+
+
+class _FakeContainer:
+    def __init__(self, cid, env_id, created):
+        self.id = cid
+        self.labels = {LABEL_ENV_ID: env_id}
+        self.attrs = {"Created": _docker_ts(created)}
+
+
+class _FakeNetwork:
+    def __init__(self, nid, env_id, created):
+        self.id = nid
+        self.attrs = {"Created": _docker_ts(created), "Labels": {LABEL_ENV_ID: env_id}}
+
+
+def _manager_with(containers=(), networks=()):
+    mgr = DockerManager()
+    client = MagicMock()
+    client.containers.list.return_value = list(containers)
+    client.networks.list.return_value = list(networks)
+    mgr._client = client
+    return mgr, client
+
+
+async def test_find_labelled_honours_grace_period():
+    """A stack still being provisioned must never be swept out from under it."""
+    now = datetime.now(timezone.utc)
+    old_id, new_id = str(uuid.uuid4()), str(uuid.uuid4())
+    mgr, _ = _manager_with(
+        containers=[
+            _FakeContainer("c-old", old_id, now - timedelta(hours=2)),
+            _FakeContainer("c-new", new_id, now),
+        ],
+        networks=[_FakeNetwork("n-old", old_id, now - timedelta(hours=2))],
+    )
+
+    found = mgr.find_labelled(min_age_seconds=900)
+
+    assert set(found) == {old_id}, "young resources must be skipped"
+    assert found[old_id].container_ids == ["c-old"]
+    assert found[old_id].network_ids == ["n-old"]
+
+
+async def test_remove_resources_tolerates_already_gone():
+    """Invariant 2: removing what is already removed is a no-op, not an error."""
+    import docker.errors
+
+    mgr, client = _manager_with()
+    client.containers.get.side_effect = docker.errors.NotFound("gone")
+    client.networks.get.side_effect = docker.errors.NotFound("gone")
+
+    mgr.remove_resources("some-env", ["c1"], ["n1"])  # must not raise
+
+
+async def test_reconcile_removes_orphans_with_no_db_row(sync_sessions):
+    orphan_id = str(uuid.uuid4())
+    fake = MagicMock()
+    fake.find_labelled.return_value = {
+        orphan_id: LabelledResources(container_ids=["c1"], network_ids=["n1"])
+    }
+
+    with patch.object(worker_tasks, "get_sync_db", lambda: sync_sessions()), \
+         patch.object(worker_tasks, "docker_manager", fake):
+        result = worker_tasks.reconcile_orphans()
+
+    assert result == {"removed": 1, "skipped": 0}
+    fake.remove_resources.assert_called_once_with(
+        env_id=orphan_id, container_ids=["c1"], network_ids=["n1"]
+    )
+
+
+async def test_reconcile_spares_running_and_sweeps_terminal(sync_sessions):
+    """Status decides: only rows that should own nothing get their resources cut."""
+    session = sync_sessions()
+    running = make_env("live", datetime.now(timezone.utc) + timedelta(hours=1))
+    stopped = make_env("dead", datetime.now(timezone.utc),
+                       status=EnvironmentStatus.STOPPED)
+    session.add_all([running, stopped])
+    session.commit()
+    running_id, stopped_id = str(running.id), str(stopped.id)
+    session.close()
+
+    fake = MagicMock()
+    fake.find_labelled.return_value = {
+        running_id: LabelledResources(container_ids=["c-live"], network_ids=[]),
+        stopped_id: LabelledResources(container_ids=["c-dead"], network_ids=["n-dead"]),
+    }
+
+    with patch.object(worker_tasks, "get_sync_db", lambda: sync_sessions()), \
+         patch.object(worker_tasks, "docker_manager", fake):
+        result = worker_tasks.reconcile_orphans()
+
+    assert result == {"removed": 1, "skipped": 1}
+    fake.remove_resources.assert_called_once_with(
+        env_id=stopped_id, container_ids=["c-dead"], network_ids=["n-dead"]
+    )
+
+
+async def test_reconcile_skips_unparseable_label(sync_sessions):
+    """A label that is not a UUID is not ours to delete."""
+    fake = MagicMock()
+    fake.find_labelled.return_value = {
+        "not-a-uuid": LabelledResources(container_ids=["c1"], network_ids=[])
+    }
+
+    with patch.object(worker_tasks, "get_sync_db", lambda: sync_sessions()), \
+         patch.object(worker_tasks, "docker_manager", fake):
+        result = worker_tasks.reconcile_orphans()
+
+    assert result == {"removed": 0, "skipped": 1}
+    fake.remove_resources.assert_not_called()
+
+
+async def test_reconcile_second_run_is_noop(sync_sessions):
+    """Invariant 2: once swept, a second pass finds nothing left to do."""
+    orphan_id = str(uuid.uuid4())
+    fake = MagicMock()
+    fake.find_labelled.side_effect = [
+        {orphan_id: LabelledResources(container_ids=["c1"], network_ids=["n1"])},
+        {},  # resources are gone now
+    ]
+
+    with patch.object(worker_tasks, "get_sync_db", lambda: sync_sessions()), \
+         patch.object(worker_tasks, "docker_manager", fake):
+        first = worker_tasks.reconcile_orphans()
+        second = worker_tasks.reconcile_orphans()
+
+    assert first == {"removed": 1, "skipped": 0}
+    assert second == {"removed": 0, "skipped": 0}
+    assert fake.remove_resources.call_count == 1
+
+
+async def test_reaper_second_run_is_noop(sync_sessions):
+    """Invariant 2: the claim means a second tick does not re-enqueue teardown."""
+    session = sync_sessions()
+    session.add(make_env("old-env", datetime.now(timezone.utc) - timedelta(minutes=5)))
+    session.commit()
+    session.close()
+
+    with patch.object(worker_tasks, "get_sync_db", lambda: sync_sessions()), \
+         patch.object(worker_tasks.teardown_environment, "delay") as mock_delay:
+        first = worker_tasks.reap_expired_environments()
+        second = worker_tasks.reap_expired_environments()
+
+    assert first == {"reaped": 1}
+    assert second == {"reaped": 0}
+    assert mock_delay.call_count == 1
