@@ -42,6 +42,53 @@ class LabelledResources:
     network_ids: list[str] = field(default_factory=list)
 
 
+def network_name(env_id: str) -> str:
+    """Invariant 6: naming is derived, never free-form."""
+    return f"env-{env_id}"
+
+
+def container_name(env_id: str, role: str) -> str:
+    """
+    Invariant 6. Also the container's DNS name inside its own bridge network,
+    which is how one role addresses another.
+    """
+    return f"env-{env_id}-{role}"
+
+
+def resolve_environment(env_id: str, spec: dict, roles: list[str]) -> dict[str, str]:
+    """
+    Substitute per-environment values into a spec's `environment` block.
+
+    A template is static but the addresses in it are not: the database lives at
+    `env-{id}-db`, which is only known once the environment has an id. Each role
+    in the template is available as `{<role>_host}`, plus `{env_id}`.
+
+    Values are formatted with `str.format`, so a literal `{` in a template value
+    would need doubling. No template needs one today; a `ValueError` here is a
+    template bug, raised at provision time rather than producing a container
+    with a half-substituted connection string.
+
+    The result carries credentials. Never log it (§9).
+    """
+    context: dict[str, str] = {"env_id": env_id}
+    for role in roles:
+        context[f"{role}_host"] = container_name(env_id, role)
+
+    resolved: dict[str, str] = {}
+    for key, value in (spec.get("environment") or {}).items():
+        if not isinstance(value, str):
+            resolved[key] = value
+            continue
+        try:
+            resolved[key] = value.format(**context)
+        except KeyError as exc:
+            raise ValueError(
+                f"Template placeholder {exc} in {key!r} matches no role in this "
+                f"template. Known: {sorted(context)}"
+            ) from exc
+    return resolved
+
+
 def _created_at(obj) -> datetime:
     """
     Docker reports RFC3339 with nanosecond precision; Python only parses
@@ -123,12 +170,14 @@ class DockerManager:
 
         # Sort specs so containers with depends_on_role come last
         specs = sorted(template, key=lambda s: 0 if "depends_on_role" not in s else 1)
+        roles = [s["role"] for s in template]
 
         for spec in specs:
             container = self._start_container(
                 env_id=env_id,
                 spec=spec,
                 network=network,
+                environment=resolve_environment(env_id, spec, roles),
             )
             container_ids.append(container.id)
             role_to_container[spec["role"]] = container
@@ -231,7 +280,7 @@ class DockerManager:
 
     def _create_network(self, env_id: str) -> Network:
         return self.client.networks.create(
-            name=f"env-{env_id}",
+            name=network_name(env_id),
             driver="bridge",
             labels={LABEL_ENV_ID: env_id},
         )
@@ -241,7 +290,10 @@ class DockerManager:
         env_id: str,
         spec: dict,
         network: Network,
+        environment: dict[str, str],
     ) -> Container:
+        # `environment` is resolved by the caller and carries credentials.
+        # It must not reach a log line (§9).
         role = spec["role"]
         ports = {}
         if spec.get("expose_port"):
@@ -250,10 +302,10 @@ class DockerManager:
 
         container: Container = self.client.containers.run(
             image=spec["image"],
-            name=f"env-{env_id}-{role}",
+            name=container_name(env_id, role),
             detach=True,
             network=network.name,
-            environment=spec.get("environment", {}),
+            environment=environment,
             ports=ports,
             labels={
                 LABEL_ENV_ID: env_id,

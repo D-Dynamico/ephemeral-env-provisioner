@@ -191,6 +191,7 @@ Alembic owns the schema. Run these inside the compose network
 ├── tests/
 │   ├── conftest.py                   # SQLite fixtures + authenticated clients
 │   ├── test_auth.py
+│   ├── test_templates.py
 │   └── test_environments.py
 ├── config.py                         # Pydantic settings
 ├── docker-compose.yml                # postgres, redis, api, worker, beat
