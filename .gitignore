@@ -1,3 +1,7 @@
+# Local-only working context — must never reach the remote (CLAUDE.md §2)
+CLAUDE.md
+SESSION_LOG.md
+
 # Environment
 .env
 .env.*
