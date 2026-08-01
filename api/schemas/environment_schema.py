@@ -9,9 +9,11 @@ from db.models import EnvironmentStatus
 # ── Request schemas ────────────────────────────────────────────────────────────
 
 class EnvironmentCreate(BaseModel):
+    # No `owner` field. The owner is the principal behind the API key: the quota
+    # and the unique-name guard are enforced per owner, and an owner the caller
+    # picks is not a guard at all.
     name: str = Field(..., min_length=3, max_length=100, pattern=r"^[a-z0-9\-]+$",
                       description="Lowercase alphanumeric slug, e.g. 'my-feature-branch'")
-    owner: str = Field(..., description="User identifier (email or ID)")
     template: str = Field(default="webapp-postgres",
                           description="Which stack template to spin up")
     ttl_seconds: int = Field(default=7200, ge=300, le=86400,
@@ -21,7 +23,6 @@ class EnvironmentCreate(BaseModel):
         "json_schema_extra": {
             "example": {
                 "name": "pr-42-auth-refactor",
-                "owner": "dev@example.com",
                 "template": "webapp-postgres",
                 "ttl_seconds": 3600,
             }

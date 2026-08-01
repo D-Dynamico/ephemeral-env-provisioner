@@ -3,11 +3,28 @@ Auth tests. The service fronts a root-equivalent Docker socket, so these cover
 the gate itself, not just the happy path (CLAUDE.md §9).
 """
 
+import uuid
+from unittest.mock import patch, MagicMock
+
 import pytest
 
 from api.auth import API_KEY_HEADER, _parse, api_key_map, MIN_KEY_LENGTH
 from config import settings
-from tests.conftest import TEST_API_KEY, TEST_PRINCIPAL
+from tests.conftest import TEST_API_KEY, TEST_PRINCIPAL, OTHER_PRINCIPAL
+
+
+def _mock_task():
+    task = MagicMock()
+    task.id = str(uuid.uuid4())
+    return task
+
+
+async def _create(http_client, name="pr-42"):
+    with patch("api.routes.environment_router.provision_environment") as mock_task:
+        mock_task.delay.return_value = _mock_task()
+        return await http_client.post(
+            "/environments/", json={"name": name, "template": "webapp-postgres"}
+        )
 
 
 # ── The gate ───────────────────────────────────────────────────────────────────
@@ -55,7 +72,6 @@ async def test_write_routes_are_gated(anon_client):
 
 @pytest.mark.asyncio
 async def test_delete_is_gated(anon_client):
-    import uuid
     r = await anon_client.delete(f"/environments/{uuid.uuid4()}")
     assert r.status_code == 401
 
@@ -80,6 +96,106 @@ async def test_unconfigured_auth_fails_closed(anon_client, monkeypatch):
     # A previously valid key is not grandfathered in.
     r = await anon_client.get("/environments/", headers={API_KEY_HEADER: TEST_API_KEY})
     assert r.status_code == 503
+
+
+# ── Ownership comes from the key ───────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_owner_is_the_principal_not_the_body(client):
+    """A caller-supplied owner is ignored; the body field no longer exists."""
+    r = await _create(client)
+    assert r.status_code == 202
+
+    env_id = r.json()["environment_id"]
+    assert (await client.get(f"/environments/{env_id}")).json()["owner"] == TEST_PRINCIPAL
+
+
+@pytest.mark.asyncio
+async def test_owner_in_body_is_rejected_not_honoured(client):
+    """
+    Extra fields must not silently set the owner. Pydantic ignores unknown keys
+    by default, so this asserts the owner is the principal regardless.
+    """
+    with patch("api.routes.environment_router.provision_environment") as mock_task:
+        mock_task.delay.return_value = _mock_task()
+        r = await client.post("/environments/", json={
+            "name": "pr-77",
+            "template": "webapp-postgres",
+            "owner": "victim@example.com",
+        })
+
+    env_id = r.json()["environment_id"]
+    body = (await client.get(f"/environments/{env_id}")).json()
+    assert body["owner"] == TEST_PRINCIPAL
+
+
+@pytest.mark.asyncio
+async def test_other_principal_cannot_read(client, other_client):
+    env_id = (await _create(client)).json()["environment_id"]
+
+    r = await other_client.get(f"/environments/{env_id}")
+    assert r.status_code == 404, "must not confirm the id exists"
+
+
+@pytest.mark.asyncio
+async def test_other_principal_cannot_delete(client, other_client):
+    env_id = (await _create(client)).json()["environment_id"]
+
+    r = await other_client.delete(f"/environments/{env_id}")
+    assert r.status_code == 404
+
+    # And the environment is untouched.
+    assert (await client.get(f"/environments/{env_id}")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_list_shows_only_the_callers_environments(client, other_client):
+    await _create(client, name="mine")
+    await _create(other_client, name="theirs")
+
+    mine = (await client.get("/environments/")).json()
+    theirs = (await other_client.get("/environments/")).json()
+
+    assert mine["total"] == 1
+    assert mine["items"][0]["name"] == "mine"
+    assert mine["items"][0]["owner"] == TEST_PRINCIPAL
+    assert theirs["total"] == 1
+    assert theirs["items"][0]["name"] == "theirs"
+    assert theirs["items"][0]["owner"] == OTHER_PRINCIPAL
+
+
+@pytest.mark.asyncio
+async def test_same_name_allowed_across_principals(client, other_client):
+    """The 409 is per owner, and owners are now real."""
+    assert (await _create(client, name="pr-42")).status_code == 202
+    assert (await _create(other_client, name="pr-42")).status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_quota_is_per_principal(client, other_client, monkeypatch):
+    """
+    The quota is the only bound on how many containers a caller can start, so
+    it must not be evadable by naming a different owner.
+    """
+    monkeypatch.setattr(settings, "max_environments_per_user", 2)
+
+    assert (await _create(client, name="one")).status_code == 202
+    assert (await _create(client, name="two")).status_code == 202
+    assert (await _create(client, name="three")).status_code == 429
+
+    # A different principal has its own budget.
+    assert (await _create(other_client, name="one")).status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_quota_reads_the_setting(client, monkeypatch):
+    """settings.max_environments_per_user was defined and unused; wire it."""
+    monkeypatch.setattr(settings, "max_environments_per_user", 1)
+
+    assert (await _create(client, name="one")).status_code == 202
+    r = await _create(client, name="two")
+    assert r.status_code == 429
+    assert "Max 1 active" in r.json()["detail"]
 
 
 # ── Key parsing ────────────────────────────────────────────────────────────────

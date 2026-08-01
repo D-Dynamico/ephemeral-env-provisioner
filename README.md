@@ -119,9 +119,9 @@ CORS sends no headers unless `CORS_ALLOW_ORIGINS` lists origins explicitly.
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/environments/` | `202` + task id. Max 5 active per owner (`429`), unique active name per owner (`409`) |
-| `GET` | `/environments/` | Filter by `owner`, `status`; `limit` / `offset` |
-| `GET` | `/environments/{id}` | Poll for status |
+| `POST` | `/environments/` | `202` + task id. Max active per principal (`429`), unique active name per principal (`409`) |
+| `GET` | `/environments/` | The caller's environments. Filter by `status`; `limit` / `offset` |
+| `GET` | `/environments/{id}` | Poll for status. `404` for another principal's environment |
 | `DELETE` | `/environments/{id}` | `202`, triggers teardown |
 | `GET` | `/health` | Open, no key |
 
@@ -130,7 +130,7 @@ CORS sends no headers unless `CORS_ALLOW_ORIGINS` lists origins explicitly.
 curl -X POST http://localhost:8000/environments/ \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"name": "pr-42", "owner": "dev@example.com", "template": "webapp-postgres", "ttl_seconds": 3600}'
+  -d '{"name": "pr-42", "template": "webapp-postgres", "ttl_seconds": 3600}'
 
 # Poll
 curl -H "X-API-Key: $API_KEY" http://localhost:8000/environments/<id>
@@ -140,6 +140,9 @@ curl -X DELETE -H "X-API-Key: $API_KEY" http://localhost:8000/environments/<id>
 ```
 
 Environment names must match `^[a-z0-9\-]+$`. TTL is clamped to 5 minutes – 24 hours.
+The owner is never sent by the caller: it is the principal behind the key, so
+the per-owner quota (`MAX_ENVIRONMENTS_PER_USER`, default 5) and the unique-name
+guard cannot be sidestepped by naming someone else.
 
 ## Tests
 

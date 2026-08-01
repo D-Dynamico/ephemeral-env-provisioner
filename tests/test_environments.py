@@ -42,7 +42,6 @@ async def test_create_environment(client):
 
         r = await client.post("/environments/", json={
             "name": "pr-42",
-            "owner": "dev@example.com",
             "template": "webapp-postgres",
             "ttl_seconds": 3600,
         })
@@ -61,14 +60,12 @@ async def test_create_duplicate_environment(client):
 
         await client.post("/environments/", json={
             "name": "pr-42",
-            "owner": "dev@example.com",
             "template": "webapp-postgres",
         })
 
-        # Second create with same name + owner should 409
+        # Second create with the same name, same principal, should 409
         r = await client.post("/environments/", json={
             "name": "pr-42",
-            "owner": "dev@example.com",
             "template": "webapp-postgres",
         })
 
@@ -81,7 +78,6 @@ async def test_get_environment(client):
         mock_task.delay.return_value = mock_celery_task()
         create_r = await client.post("/environments/", json={
             "name": "pr-99",
-            "owner": "dev@example.com",
             "template": "webapp-postgres",
         })
 
@@ -105,11 +101,10 @@ async def test_list_environments(client):
         for i in range(3):
             await client.post("/environments/", json={
                 "name": f"env-{i}",
-                "owner": "dev@example.com",
                 "template": "webapp-postgres",
             })
 
-    r = await client.get("/environments/?owner=dev@example.com")
+    r = await client.get("/environments/")
     assert r.status_code == 200
     assert r.json()["total"] == 3
 
@@ -118,7 +113,6 @@ async def test_list_environments(client):
 async def test_invalid_env_name(client):
     r = await client.post("/environments/", json={
         "name": "UPPERCASE_INVALID",
-        "owner": "dev@example.com",
         "template": "webapp-postgres",
     })
     assert r.status_code == 422  # Pydantic validation error
