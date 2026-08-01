@@ -6,8 +6,10 @@ Phase 1: single-container webapp + postgres, port-mapped to host.
 """
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 import docker
 import docker.errors
@@ -18,6 +20,12 @@ from config import settings
 
 log = logging.getLogger(__name__)
 
+# Every resource this service creates carries this label. It is the only way to
+# find resources again when the DB has no record of them (invariant 3), so the
+# create path and the sweep must agree on it exactly — hence one constant.
+LABEL_ENV_ID = "provisioner.env_id"
+LABEL_ROLE = "provisioner.role"
+
 
 @dataclass
 class StackResult:
@@ -25,6 +33,30 @@ class StackResult:
     network_id: str
     container_ids: list[str]
     host_port: int
+
+
+@dataclass
+class LabelledResources:
+    """Docker resources found by label for a single env_id."""
+    container_ids: list[str] = field(default_factory=list)
+    network_ids: list[str] = field(default_factory=list)
+
+
+def _created_at(obj) -> datetime:
+    """
+    Docker reports RFC3339 with nanosecond precision; Python only parses
+    microseconds, so the fraction is truncated to six digits.
+    """
+    raw = obj.attrs.get("Created")
+    if not raw:
+        # No timestamp means it cannot be aged out safely; treat it as brand new.
+        return datetime.now(timezone.utc)
+    cleaned = re.sub(r"(\.\d{6})\d+", r"\1", raw.replace("Z", "+00:00"))
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return datetime.now(timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 # ── Template definitions ───────────────────────────────────────────────────────
@@ -125,6 +157,24 @@ class DockerManager:
 
     def teardown(self, env_id: str, container_ids: list[str], network_id: str | None) -> None:
         """Stop and remove all containers and the network for an environment."""
+        self.remove_resources(
+            env_id=env_id,
+            container_ids=container_ids,
+            network_ids=[network_id] if network_id else [],
+        )
+
+    def remove_resources(
+        self,
+        env_id: str,
+        container_ids: list[str],
+        network_ids: list[str],
+    ) -> None:
+        """
+        Remove the given containers and networks. Idempotent: anything already
+        gone is a no-op, not an error (invariant 2). Containers are removed
+        before networks, since a network with an attached container cannot be
+        removed.
+        """
         for cid in container_ids:
             try:
                 container = self.client.containers.get(cid)
@@ -136,15 +186,46 @@ class DockerManager:
             except Exception as exc:
                 log.error("Error removing container %s: %s", cid[:12], exc)
 
-        if network_id:
+        for nid in network_ids:
             try:
-                network = self.client.networks.get(network_id)
+                network = self.client.networks.get(nid)
                 network.remove()
-                log.info("Removed network %s (env=%s)", network_id[:12], env_id)
+                log.info("Removed network %s (env=%s)", nid[:12], env_id)
             except docker.errors.NotFound:
                 pass
             except Exception as exc:
-                log.error("Error removing network %s: %s", network_id[:12], exc)
+                log.error("Error removing network %s: %s", nid[:12], exc)
+
+    def find_labelled(self, min_age_seconds: int = 0) -> dict[str, LabelledResources]:
+        """
+        Group every Docker resource carrying LABEL_ENV_ID by that id.
+
+        This is the actual state half of reconciliation: it finds resources the
+        DB has no record of, which is the only way to recover from a provision
+        that died after creating the network but before persisting its id
+        (invariant 4).
+
+        `min_age_seconds` skips resources younger than the grace period, so a
+        stack still being built is never swept out from under its worker.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=min_age_seconds)
+        found: dict[str, LabelledResources] = {}
+
+        for container in self.client.containers.list(
+            all=True, filters={"label": LABEL_ENV_ID}
+        ):
+            env_id = (container.labels or {}).get(LABEL_ENV_ID)
+            if not env_id or _created_at(container) > cutoff:
+                continue
+            found.setdefault(env_id, LabelledResources()).container_ids.append(container.id)
+
+        for network in self.client.networks.list(filters={"label": LABEL_ENV_ID}):
+            env_id = (network.attrs.get("Labels") or {}).get(LABEL_ENV_ID)
+            if not env_id or _created_at(network) > cutoff:
+                continue
+            found.setdefault(env_id, LabelledResources()).network_ids.append(network.id)
+
+        return found
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -152,7 +233,7 @@ class DockerManager:
         return self.client.networks.create(
             name=f"env-{env_id}",
             driver="bridge",
-            labels={"provisioner.env_id": env_id},
+            labels={LABEL_ENV_ID: env_id},
         )
 
     def _start_container(
@@ -175,8 +256,8 @@ class DockerManager:
             environment=spec.get("environment", {}),
             ports=ports,
             labels={
-                "provisioner.env_id": env_id,
-                "provisioner.role": role,
+                LABEL_ENV_ID: env_id,
+                LABEL_ROLE: role,
             },
         )
         return container
