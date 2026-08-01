@@ -4,15 +4,21 @@ and an in-memory SQLite database (no Docker needed to run tests).
 """
 
 import uuid
+from datetime import datetime, timedelta, timezone
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from unittest.mock import patch, MagicMock
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from db.models import Base, EnvironmentStatus
+from db.models import Base, Environment, EnvironmentStatus
 from db.session import get_db
 from api.main import app
+import worker.tasks as worker_tasks
 
 # ── Test DB (SQLite in-memory) ─────────────────────────────────────────────────
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
@@ -38,6 +44,9 @@ async def setup_db():
     yield
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+    # aiosqlite opens a non-daemon thread per connection; without this the
+    # interpreter hangs at exit after the last test reports.
+    await test_engine.dispose()
 
 
 @pytest_asyncio.fixture
@@ -154,3 +163,69 @@ async def test_invalid_env_name(client):
         "template": "webapp-postgres",
     })
     assert r.status_code == 422  # Pydantic validation error
+
+
+# ── Reaper tests ───────────────────────────────────────────────────────────────
+# The reaper runs in the Celery worker, which uses sync SQLAlchemy — so it needs
+# its own sync SQLite DB rather than the async one the API tests share.
+
+@pytest.fixture
+def sync_sessions():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,  # keep one connection so :memory: survives
+    )
+    Base.metadata.create_all(engine)
+    yield sessionmaker(bind=engine, expire_on_commit=False)
+    engine.dispose()
+
+
+def make_env(name: str, expires_at, status=EnvironmentStatus.RUNNING) -> Environment:
+    return Environment(
+        name=name,
+        owner="dev@example.com",
+        template="webapp-postgres",
+        status=status,
+        ttl_seconds=300,
+        expires_at=expires_at,
+    )
+
+
+async def test_reaper_tears_down_only_expired(sync_sessions):
+    now = datetime.now(timezone.utc)
+    session = sync_sessions()
+    expired = make_env("old-env", now - timedelta(minutes=5))
+    alive = make_env("new-env", now + timedelta(hours=1))
+    session.add_all([expired, alive])
+    session.commit()
+    expired_id, alive_id = expired.id, alive.id
+    session.close()
+
+    with patch.object(worker_tasks, "get_sync_db", lambda: sync_sessions()), \
+         patch.object(worker_tasks.teardown_environment, "delay") as mock_delay:
+        result = worker_tasks.reap_expired_environments()
+
+    assert result == {"reaped": 1}
+    mock_delay.assert_called_once_with(str(expired_id))
+
+    check = sync_sessions()
+    assert check.get(Environment, expired_id).status == EnvironmentStatus.STOPPING
+    assert check.get(Environment, alive_id).status == EnvironmentStatus.RUNNING
+    check.close()
+
+
+async def test_reaper_ignores_non_running(sync_sessions):
+    """An already-stopping env must not be enqueued twice."""
+    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    session = sync_sessions()
+    session.add(make_env("stopping-env", past, status=EnvironmentStatus.STOPPING))
+    session.commit()
+    session.close()
+
+    with patch.object(worker_tasks, "get_sync_db", lambda: sync_sessions()), \
+         patch.object(worker_tasks.teardown_environment, "delay") as mock_delay:
+        result = worker_tasks.reap_expired_environments()
+
+    assert result == {"reaped": 0}
+    mock_delay.assert_not_called()

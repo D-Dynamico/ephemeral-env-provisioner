@@ -10,6 +10,10 @@ __pycache__/
 .venv/
 venv/
 
+# Celery beat scheduler state
+celerybeat-schedule*
+celerybeat.pid
+
 # Testing
 .pytest_cache/
 .coverage

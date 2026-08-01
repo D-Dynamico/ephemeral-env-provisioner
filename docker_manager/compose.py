@@ -58,7 +58,18 @@ TEMPLATES: dict[str, list[dict]] = {
 
 class DockerManager:
     def __init__(self) -> None:
-        self.client = docker.DockerClient(base_url=settings.docker_socket)
+        self._client: docker.DockerClient | None = None
+
+    @property
+    def client(self) -> docker.DockerClient:
+        """
+        Connect lazily. The API process imports this module (via worker.tasks)
+        but never touches Docker, and tests must run without a daemon — so
+        connecting in __init__ would make both fail at import time.
+        """
+        if self._client is None:
+            self._client = docker.DockerClient(base_url=settings.docker_socket)
+        return self._client
 
     # ── Public API ─────────────────────────────────────────────────────────────
 

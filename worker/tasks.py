@@ -37,6 +37,14 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1, # One task at a time per worker process
 )
 
+# Periodic sweep for expired environments — requires `celery -A worker.tasks beat`.
+celery_app.conf.beat_schedule = {
+    "reap-expired": {
+        "task": "worker.tasks.reap_expired_environments",
+        "schedule": 60.0,
+    },
+}
+
 # ── Sync DB session for Celery (sync SQLAlchemy, not async) ───────────────────
 # Celery tasks run in their own threads/processes, so we use sync SQLAlchemy.
 sync_engine = create_engine(
@@ -147,6 +155,40 @@ def teardown_environment(self, env_id: str) -> dict:
     except Exception as exc:
         log.exception("[%s] Teardown failed: %s", env_id, exc)
         raise self.retry(exc=exc)
+
+    finally:
+        db.close()
+
+
+@celery_app.task
+def reap_expired_environments() -> dict:
+    """
+    Periodic sweep — tear down environments whose TTL has elapsed.
+
+    Each row is claimed by flipping it to STOPPING before the teardown task is
+    enqueued, so a second beat tick cannot enqueue teardown for the same
+    environment twice.
+    """
+    db = get_sync_db()
+    try:
+        now = datetime.now(timezone.utc)
+        expired = db.query(Environment).filter(
+            Environment.status == EnvironmentStatus.RUNNING,
+            Environment.expires_at <= now,
+        ).all()
+
+        if not expired:
+            return {"reaped": 0}
+
+        for env in expired:
+            env.status = EnvironmentStatus.STOPPING
+        db.commit()
+
+        for env in expired:
+            teardown_environment.delay(str(env.id))
+            log.info("[%s] TTL expired — teardown enqueued", env.id)
+
+        return {"reaped": len(expired)}
 
     finally:
         db.close()
