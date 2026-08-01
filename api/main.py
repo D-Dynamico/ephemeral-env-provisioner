@@ -5,7 +5,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.auth import API_KEY_HEADER, api_key_map
 from api.routes.environment_router import router as env_router
+from config import settings
 
 structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
@@ -16,7 +18,18 @@ log = structlog.get_logger()
 async def lifespan(app: FastAPI):
     # Schema is owned by Alembic (CLAUDE.md §7). The app never creates tables;
     # `alembic upgrade head` runs before the API starts (see docker-compose.yml).
-    log.info("Starting up")
+
+    # Fail closed. This process can start containers on a root-equivalent Docker
+    # socket, so booting without auth is worse than not booting: it looks like a
+    # working service. Raising here stops the container rather than serving.
+    # Never log the keys themselves, only how many there are (§9).
+    keys = api_key_map()  # raises ValueError on a malformed API_KEYS value
+    if not keys:
+        raise RuntimeError(
+            "API_KEYS is empty. Set it to one or more 'key:principal' pairs "
+            "before starting the API; see env.example."
+        )
+    log.info("Starting up", principals=len(set(keys.values())))
     yield
     log.info("Shutting down")
 
@@ -30,12 +43,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Only mounted when origins are configured. There is no first-party web UI, so
+# the default is to send no CORS headers at all rather than a permissive set.
+# Credentials stay off: the credential is a header, not a cookie, so browsers
+# never attach it automatically.
+if settings.cors_origin_list:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origin_list,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Content-Type", API_KEY_HEADER],
+    )
 
 app.include_router(env_router)
 

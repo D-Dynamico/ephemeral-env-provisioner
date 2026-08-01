@@ -70,7 +70,8 @@ reconciler cannot delete a stack that is still being built.
 ## Quick start
 
 ```bash
-# 1. Copy env config
+# 1. Copy env config, then set API_KEYS to a real key — the API will not
+#    start without it. See Authentication below.
 cp env.example .env
 
 # 2. Start the stack — postgres, redis, api, worker, beat
@@ -87,6 +88,33 @@ never creates its own tables.
 > contend with Docker's published port 5432. Run `psql`/`alembic` inside the
 > compose network rather than against `localhost`.
 
+## Authentication
+
+Every `/environments` route requires an `X-API-Key` header. `/health` and the
+docs are open.
+
+Keys are configured as `key:principal` pairs in `API_KEYS`:
+
+```bash
+# Generate a key
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+# .env
+API_KEYS=<generated>:dev@example.com,<another>:ci
+```
+
+**The API refuses to start when `API_KEYS` is empty.** A process that can start
+containers on a root-equivalent socket has no safe default-open mode.
+
+The principal is the identity that owns whatever that key creates. Minimum key
+length is 16 characters; duplicate keys are rejected at startup.
+
+What this is not: there is no key rotation, expiry, hashing at rest, per-key
+scope or rate limiting. Keys sit in the process environment in plaintext. This
+closes the unauthenticated-RCE hole; it is not user management.
+
+CORS sends no headers unless `CORS_ALLOW_ORIGINS` lists origins explicitly.
+
 ## Endpoints
 
 | Method | Path | Notes |
@@ -95,19 +123,20 @@ never creates its own tables.
 | `GET` | `/environments/` | Filter by `owner`, `status`; `limit` / `offset` |
 | `GET` | `/environments/{id}` | Poll for status |
 | `DELETE` | `/environments/{id}` | `202`, triggers teardown |
-| `GET` | `/health` | |
+| `GET` | `/health` | Open, no key |
 
 ```bash
 # Create
 curl -X POST http://localhost:8000/environments/ \
+  -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"name": "pr-42", "owner": "dev@example.com", "template": "webapp-postgres", "ttl_seconds": 3600}'
 
 # Poll
-curl http://localhost:8000/environments/<id>
+curl -H "X-API-Key: $API_KEY" http://localhost:8000/environments/<id>
 
 # Tear down early
-curl -X DELETE http://localhost:8000/environments/<id>
+curl -X DELETE -H "X-API-Key: $API_KEY" http://localhost:8000/environments/<id>
 ```
 
 Environment names must match `^[a-z0-9\-]+$`. TTL is clamped to 5 minutes – 24 hours.
@@ -142,6 +171,7 @@ Alembic owns the schema. Run these inside the compose network
 .
 ├── api/
 │   ├── main.py                       # FastAPI app + lifespan
+│   ├── auth.py                       # API-key → principal, fail-closed
 │   ├── routes/
 │   │   └── environment_router.py     # Environment endpoints
 │   └── schemas/
@@ -156,6 +186,8 @@ Alembic owns the schema. Run these inside the compose network
 ├── alembic/
 │   └── versions/                     # Migrations
 ├── tests/
+│   ├── conftest.py                   # SQLite fixtures + authenticated clients
+│   ├── test_auth.py
 │   └── test_environments.py
 ├── config.py                         # Pydantic settings
 ├── docker-compose.yml                # postgres, redis, api, worker, beat
@@ -167,6 +199,7 @@ Alembic owns the schema. Run these inside the compose network
 Templates are a fixed allowlist; `webapp-postgres` runs `postgres:16-alpine`
 alongside `kennethreitz/httpbin` as a stand-in application.
 
-**There is no authentication, and CORS is open to all origins.** The service
-requires access to the Docker socket, which is root-equivalent on the host, so
-do not expose this outside a trusted network as it stands.
+The service requires access to the Docker socket, which is root-equivalent on
+the host. Authentication is a static API-key allowlist (see below) — enough that
+the provisioning endpoints are not open to the internet, and not a substitute
+for running this behind a network boundary you control.

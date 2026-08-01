@@ -7,58 +7,16 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-import pytest_asyncio
-from httpx import AsyncClient, ASGITransport
 from unittest.mock import patch, MagicMock
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from db.models import Base, Environment, EnvironmentStatus
-from db.session import get_db
-from api.main import app
 import worker.tasks as worker_tasks
 from docker_manager.compose import DockerManager, LabelledResources, LABEL_ENV_ID
 
-# ── Test DB (SQLite in-memory) ─────────────────────────────────────────────────
-TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
-
-test_engine = create_async_engine(TEST_DB_URL, echo=False)
-TestSession = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
-
-
-async def override_get_db():
-    async with TestSession() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def setup_db():
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    # aiosqlite opens a non-daemon thread per connection; without this the
-    # interpreter hangs at exit after the last test reports.
-    await test_engine.dispose()
-
-
-@pytest_asyncio.fixture
-async def client():
-    app.dependency_overrides[get_db] = override_get_db
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as ac:
-        yield ac
-    app.dependency_overrides.clear()
-
+# DB, dependency overrides and authenticated clients live in conftest.py.
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 

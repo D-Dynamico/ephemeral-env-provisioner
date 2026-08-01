@@ -16,6 +16,17 @@ class Settings(BaseSettings):
     app_env: str = "development"
     secret_key: str = "change-me"
 
+    # Auth. Comma-separated `key:principal` pairs, e.g.
+    #   API_KEYS=k_local_dev_0123456789:dev@example.com,k_ci_9876543210abcd:ci
+    # The principal owns whatever that key creates. Empty means unconfigured,
+    # and the API refuses to start — an open Docker socket must fail closed.
+    api_keys: str = ""
+
+    # Comma-separated browser origins allowed to call the API. Empty means no
+    # CORS headers are sent at all, which is the right default for a service
+    # with no first-party web UI.
+    cors_allow_origins: str = ""
+
     # Database
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/provisioner"
 
@@ -48,6 +59,10 @@ class Settings(BaseSettings):
     pending_timeout_seconds: int = 600
     provisioning_timeout_seconds: int = 900
     stopping_timeout_seconds: int = 600
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_allow_origins.split(",") if o.strip()]
 
 
 settings = Settings()

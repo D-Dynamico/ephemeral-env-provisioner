@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.auth import require_principal
 from api.schemas.environment_schema import (
     EnvironmentCreate,
     EnvironmentResponse,
@@ -16,7 +17,14 @@ from db.models import Environment, EnvironmentStatus
 from db.session import get_db
 from worker.tasks import provision_environment, teardown_environment
 
-router = APIRouter(prefix="/environments", tags=["environments"])
+# Auth is applied to the whole router, not per route, so a route added later is
+# protected by default. `/health` and the docs live outside it and stay open.
+router = APIRouter(
+    prefix="/environments",
+    tags=["environments"],
+    dependencies=[Depends(require_principal)],
+    responses={401: {"description": "Missing or invalid X-API-Key header"}},
+)
 
 
 # ── POST /environments ─────────────────────────────────────────────────────────
