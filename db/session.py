@@ -1,5 +1,4 @@
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from db.models import Base
 from config import settings
 
 engine = create_async_engine(
@@ -13,12 +12,6 @@ AsyncSessionLocal = async_sessionmaker(
     class_=AsyncSession,
     expire_on_commit=False,
 )
-
-
-async def init_db() -> None:
-    """Create all tables. Use Alembic for prod migrations."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
 
 
 async def get_db():

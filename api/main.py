@@ -6,7 +6,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes.environment_router import router as env_router
-from db.session import init_db
 
 structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
@@ -15,8 +14,9 @@ log = structlog.get_logger()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting up — initialising database")
-    await init_db()
+    # Schema is owned by Alembic (CLAUDE.md §7). The app never creates tables;
+    # `alembic upgrade head` runs before the API starts (see docker-compose.yml).
+    log.info("Starting up")
     yield
     log.info("Shutting down")
 
