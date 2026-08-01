@@ -41,5 +41,13 @@ class Settings(BaseSettings):
     # being provisioned is not removed out from under its worker.
     orphan_grace_seconds: int = 900
 
+    # How long a row may sit in a transient state before it is presumed dead.
+    # A worker that is killed (rather than raising) leaves no task behind to
+    # move the row, so only a sweep can free it.
+    stale_sweep_interval_seconds: int = 120
+    pending_timeout_seconds: int = 600
+    provisioning_timeout_seconds: int = 900
+    stopping_timeout_seconds: int = 600
+
 
 settings = Settings()

@@ -412,3 +412,133 @@ async def test_reaper_second_run_is_noop(sync_sessions):
     assert first == {"reaped": 1}
     assert second == {"reaped": 0}
     assert mock_delay.call_count == 1
+
+
+# ── Stale transition recovery tests ────────────────────────────────────────────
+
+def _aged(status, seconds_ago):
+    """An environment sitting in `status` since `seconds_ago`."""
+    env = make_env(f"env-{uuid.uuid4().hex[:6]}", None, status=status)
+    env.status_changed_at = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+    return env
+
+
+async def test_set_status_bumps_status_changed_at():
+    """The sweeps key off this; a transition that forgets it strands the row."""
+    env = make_env("x", None, status=EnvironmentStatus.PENDING)
+    env.status_changed_at = datetime.now(timezone.utc) - timedelta(hours=5)
+
+    env.set_status(EnvironmentStatus.RUNNING)
+
+    assert env.status == EnvironmentStatus.RUNNING
+    age = datetime.now(timezone.utc) - env.status_changed_at
+    assert age < timedelta(seconds=5)
+
+
+async def test_recover_frees_all_stale_transient_states(sync_sessions):
+    session = sync_sessions()
+    session.add_all([
+        _aged(EnvironmentStatus.PENDING, 3600),
+        _aged(EnvironmentStatus.PROVISIONING, 3600),
+        _aged(EnvironmentStatus.STOPPING, 3600),
+    ])
+    session.commit()
+    session.close()
+
+    with patch.object(worker_tasks, "get_sync_db", lambda: sync_sessions()):
+        result = worker_tasks.recover_stale_transitions()
+
+    assert result["total"] == 3
+    assert result["recovered"] == {"pending": 1, "provisioning": 1, "stopping": 1}
+
+    check = sync_sessions()
+    rows = check.query(Environment).all()
+    assert all(r.status == EnvironmentStatus.FAILED for r in rows)
+    assert all("Presumed dead" in r.error_message for r in rows)
+    check.close()
+
+
+async def test_recover_spares_fresh_and_terminal_rows(sync_sessions):
+    session = sync_sessions()
+    fresh = _aged(EnvironmentStatus.PROVISIONING, 10)      # inside the timeout
+    running = _aged(EnvironmentStatus.RUNNING, 99999)      # not transient
+    stopped = _aged(EnvironmentStatus.STOPPED, 99999)      # already terminal
+    session.add_all([fresh, running, stopped])
+    session.commit()
+    ids = (fresh.id, running.id, stopped.id)
+    session.close()
+
+    with patch.object(worker_tasks, "get_sync_db", lambda: sync_sessions()):
+        result = worker_tasks.recover_stale_transitions()
+
+    assert result["total"] == 0
+
+    check = sync_sessions()
+    assert check.get(Environment, ids[0]).status == EnvironmentStatus.PROVISIONING
+    assert check.get(Environment, ids[1]).status == EnvironmentStatus.RUNNING
+    assert check.get(Environment, ids[2]).status == EnvironmentStatus.STOPPED
+    check.close()
+
+
+async def test_recover_ignores_null_status_changed_at(sync_sessions):
+    """Rows predating the column must not be read as infinitely stale."""
+    session = sync_sessions()
+    env = make_env("legacy", None, status=EnvironmentStatus.PROVISIONING)
+    env.status_changed_at = None
+    session.add(env)
+    session.commit()
+    env_id = env.id
+    session.close()
+
+    with patch.object(worker_tasks, "get_sync_db", lambda: sync_sessions()):
+        result = worker_tasks.recover_stale_transitions()
+
+    assert result["total"] == 0
+    check = sync_sessions()
+    assert check.get(Environment, env_id).status == EnvironmentStatus.PROVISIONING
+    check.close()
+
+
+async def test_recover_second_run_is_noop(sync_sessions):
+    """Invariant 2: FAILED is terminal, so the second pass finds nothing."""
+    session = sync_sessions()
+    session.add(_aged(EnvironmentStatus.PROVISIONING, 3600))
+    session.commit()
+    session.close()
+
+    with patch.object(worker_tasks, "get_sync_db", lambda: sync_sessions()):
+        first = worker_tasks.recover_stale_transitions()
+        second = worker_tasks.recover_stale_transitions()
+
+    assert first["total"] == 1
+    assert second["total"] == 0
+
+
+async def test_recovered_rows_become_sweepable(sync_sessions):
+    """The two sweeps compose: recovery makes a row terminal, so orphan
+    reclaims its Docker resources on the next pass."""
+    session = sync_sessions()
+    env = _aged(EnvironmentStatus.PROVISIONING, 3600)
+    session.add(env)
+    session.commit()
+    env_id = str(env.id)
+    session.close()
+
+    fake = MagicMock()
+    fake.find_labelled.return_value = {
+        env_id: LabelledResources(container_ids=["c1"], network_ids=["n1"])
+    }
+
+    with patch.object(worker_tasks, "get_sync_db", lambda: sync_sessions()), \
+         patch.object(worker_tasks, "docker_manager", fake):
+        # Before recovery the row is PROVISIONING, so its resources are spared.
+        assert worker_tasks.reconcile_orphans() == {"removed": 0, "skipped": 1}
+
+        worker_tasks.recover_stale_transitions()
+
+        # Now FAILED, so the same resources are reclaimed.
+        assert worker_tasks.reconcile_orphans() == {"removed": 1, "skipped": 0}
+
+    fake.remove_resources.assert_called_once_with(
+        env_id=env_id, container_ids=["c1"], network_ids=["n1"]
+    )
