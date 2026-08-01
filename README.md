@@ -74,10 +74,14 @@ reconciler cannot delete a stack that is still being built.
 #    start without it. See Authentication below.
 cp env.example .env
 
-# 2. Start the stack — postgres, redis, api, worker, beat
+# 2. Build the image environments will run. The provisioner starts
+#    pre-existing images and never builds one, so this is a prerequisite.
+docker build -t provisioner/demo-app:1 templates/demo-app
+
+# 3. Start the stack — postgres, redis, api, worker, beat
 docker compose up --build
 
-# 3. API at        http://localhost:8000
+# 4. API at        http://localhost:8000
 #    Swagger UI at http://localhost:8000/docs
 ```
 
@@ -87,6 +91,37 @@ never creates its own tables.
 > **Note:** if a PostgreSQL service is already running on the host, it will
 > contend with Docker's published port 5432. Run `psql`/`alembic` inside the
 > compose network rather than against `localhost`.
+
+## Templates
+
+Templates are a fixed in-process allowlist (`docker_manager/compose.py`). A
+caller picks a template by name and can never supply an image, a command, or a
+mount.
+
+`webapp-postgres` is two containers on their own bridge network:
+
+| Role | Image | Notes |
+|---|---|---|
+| `db` | `postgres:16-alpine` | Internal only, no host port. Healthcheck: `pg_isready` |
+| `app` | `provisioner/demo-app:1` | Built from `templates/demo-app`. Mapped to a random host port |
+
+The app writes to the database in **its own** environment: open it and each
+reload records a visit, so the count starts at zero in every new environment.
+That is the point of the template — it demonstrates network isolation and
+per-environment state rather than asserting them.
+
+Values in a template resolve per environment. `{db_host}` becomes the db
+container's name, which is its DNS name on that environment's network, and
+`{env_id}` becomes the id. A placeholder that matches no role in the template
+raises at provision time.
+
+Each role can declare a healthcheck. Provisioning waits for one role to report
+healthy before starting the role that depends on it — Postgres accepts
+connections several seconds after its container reports `running`, and an app
+that connects on boot would otherwise race it.
+
+Changing the app means rebuilding and re-tagging its image. The provisioner
+starts pre-existing images and does not build (see *What it is not*).
 
 ## Authentication
 
@@ -183,6 +218,10 @@ Alembic owns the schema. Run these inside the compose network
 │   └── tasks.py                      # Celery tasks: provision, teardown, 3 sweeps
 ├── docker_manager/
 │   └── compose.py                    # Docker SDK wrapper, templates, label discovery
+├── templates/
+│   └── demo-app/                     # The app environments run. Built out of band,
+│       ├── Dockerfile                # never built by the provisioner
+│       └── app.py
 ├── db/
 │   ├── models.py                     # SQLAlchemy ORM models + set_status
 │   └── session.py                    # Async session factory
@@ -200,8 +239,8 @@ Alembic owns the schema. Run these inside the compose network
 
 ## Status
 
-Templates are a fixed allowlist; `webapp-postgres` runs `postgres:16-alpine`
-alongside `kennethreitz/httpbin` as a stand-in application.
+There are no container CPU or memory limits yet. The quota bounds how many
+environments a principal can run, not what each one consumes.
 
 The service requires access to the Docker socket, which is root-equivalent on
 the host. Authentication is a static API-key allowlist (see below) — enough that

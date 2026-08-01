@@ -26,6 +26,11 @@ log = logging.getLogger(__name__)
 LABEL_ENV_ID = "provisioner.env_id"
 LABEL_ROLE = "provisioner.role"
 
+# Built out of band, not by this service. Named here so the failure message can
+# tell an operator exactly what to run.
+DEMO_APP_IMAGE = "provisioner/demo-app:1"
+DEMO_APP_BUILD = f"docker build -t {DEMO_APP_IMAGE} templates/demo-app"
+
 
 @dataclass
 class StackResult:
@@ -157,11 +162,31 @@ TEMPLATES: dict[str, list[dict]] = {
         },
         {
             "role": "app",
-            "image": "kennethreitz/httpbin",  # lightweight demo app
-            "environment": {},
-            "expose_port": 80,          # this port gets mapped to a random host port
-            "internal_port": 80,
+            # Built out of band from templates/demo-app; the provisioner never
+            # builds images (§1). See DEMO_APP_IMAGE below.
+            "image": DEMO_APP_IMAGE,
+            "environment": {
+                # `{db_host}` resolves to the db container's name, which is its
+                # DNS name on this environment's own bridge network.
+                "DATABASE_URL": "postgresql://app:app@{db_host}:5432/app",
+                "ENV_ID": "{env_id}",
+            },
+            "expose_port": 8000,        # this port gets mapped to a random host port
+            "internal_port": 8000,
             "depends_on_role": "db",    # start db first
+            "healthcheck": {
+                # Checks the database too, so `healthy` means actually usable.
+                # Uses python rather than curl: the slim image has no curl.
+                "test": [
+                    "CMD-SHELL",
+                    "python -c \"import urllib.request; "
+                    "urllib.request.urlopen('http://localhost:8000/health')\"",
+                ],
+                "interval_seconds": 2,
+                "timeout_seconds": 5,
+                "retries": 20,
+                "start_period_seconds": 3,
+            },
         },
     ],
 }
@@ -336,19 +361,27 @@ class DockerManager:
         if spec.get("healthcheck"):
             kwargs["healthcheck"] = to_docker_healthcheck(spec["healthcheck"])
 
-        container: Container = self.client.containers.run(
-            image=spec["image"],
+        try:
+            container: Container = self.client.containers.run(
+                image=spec["image"],
             name=container_name(env_id, role),
-            detach=True,
-            network=network.name,
-            environment=environment,
-            ports=ports,
-            labels={
-                LABEL_ENV_ID: env_id,
-                LABEL_ROLE: role,
-            },
-            **kwargs,
-        )
+                detach=True,
+                network=network.name,
+                environment=environment,
+                ports=ports,
+                labels={
+                    LABEL_ENV_ID: env_id,
+                    LABEL_ROLE: role,
+                },
+                **kwargs,
+            )
+        except docker.errors.ImageNotFound as exc:
+            # The demo app image is a prerequisite, not something this service
+            # builds. Say so, rather than surfacing a bare pull failure.
+            hint = f" Build it first: {DEMO_APP_BUILD}" if spec["image"] == DEMO_APP_IMAGE else ""
+            raise RuntimeError(
+                f"Image {spec['image']!r} is not available on the Docker host.{hint}"
+            ) from exc
         return container
 
     def _wait_for_ready(
