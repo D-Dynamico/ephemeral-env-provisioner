@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     default_container_cpu_limit: float = 1.0    # cores; converted to nano_cpus
     default_container_pids_limit: int = 256     # fork-bomb ceiling
 
+    # Metrics. The worker counts provisions and teardowns but has no HTTP
+    # surface of its own, so it serves them here. Never published to the host —
+    # see docker-compose.yml. The API's /metrics is on the API's own port and
+    # sits behind X-API-Key; this one has no authentication available to it.
+    worker_metrics_port: int = 9100
+
     # Reconciliation
     reap_interval_seconds: int = 60
     orphan_sweep_interval_seconds: int = 300

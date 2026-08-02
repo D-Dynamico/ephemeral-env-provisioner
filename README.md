@@ -269,9 +269,11 @@ Alembic owns the schema. Run these inside the compose network
 │   ├── test_auth.py
 │   ├── test_templates.py
 │   ├── test_observability.py
+│   ├── test_metrics.py
 │   └── test_environments.py
 ├── config.py                         # Pydantic settings
 ├── observability.py                  # Shared structlog config + env_id binding
+├── metrics.py                        # Prometheus metric definitions, shared
 ├── docker-compose.yml                # postgres, redis, api, worker, beat
 └── Dockerfile
 ```
