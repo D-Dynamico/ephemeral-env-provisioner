@@ -445,6 +445,15 @@ class DockerManager:
         while time.time() < deadline:
             container.reload()
             if container.status in ("exited", "dead"):
+                # A container killed at its memory ceiling looks exactly like one
+                # that crashed, and sends the next reader hunting the wrong bug.
+                # Docker records the difference; say which it was.
+                if container.attrs.get("State", {}).get("OOMKilled"):
+                    raise RuntimeError(
+                        f"Container {container.short_id} ({spec['role']}) exceeded "
+                        f"its memory limit of {resource_limits(spec)['mem_limit']} "
+                        "and was killed during startup"
+                    )
                 raise RuntimeError(
                     f"Container {container.short_id} ({spec['role']}) died during startup"
                 )

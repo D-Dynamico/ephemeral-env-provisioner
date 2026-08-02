@@ -129,7 +129,8 @@ template allowlist. The defaults live in `config.py`
 The limits bound the host, not just the environment: `webapp-postgres` costs
 1.0 core and 640m per environment, so the five-environment quota caps one
 principal at 5 cores and ~3.2GB. Swap is pinned to the memory limit, so the
-ceiling cannot be evaded by swapping.
+ceiling cannot be evaded by swapping. A container killed at its limit reports
+that it exceeded the limit rather than that it crashed.
 
 Changing the app means rebuilding and re-tagging its image. The provisioner
 starts pre-existing images and does not build (see *What it is not*).

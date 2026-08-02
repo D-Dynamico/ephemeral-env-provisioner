@@ -214,11 +214,14 @@ def test_start_container_passes_limits_to_docker():
 
 # ── Readiness ──────────────────────────────────────────────────────────────────
 
-def _container(status="running", health=None):
+def _container(status="running", health=None, oom=False):
     c = MagicMock()
     c.status = status
     c.short_id = "abc123"
-    c.attrs = {"State": {"Health": {"Status": health}} if health else {}}
+    state: dict = {"Health": {"Status": health}} if health else {}
+    if oom:
+        state["OOMKilled"] = True
+    c.attrs = {"State": state}
     c.reload = MagicMock()
     return c
 
@@ -262,6 +265,18 @@ def test_exited_container_fails_fast():
 
     with pytest.raises(RuntimeError, match="died during startup"):
         mgr._wait_for_ready(_container(status="exited"), {"role": "app"}, timeout=30)
+
+
+def test_oom_kill_names_the_memory_limit():
+    """
+    An OOM kill and a crash look identical from `status`. Reporting them the
+    same way sends the next reader hunting the wrong bug.
+    """
+    mgr = DockerManager()
+    spec = {"role": "app", "memory_limit": "384m"}
+
+    with pytest.raises(RuntimeError, match="exceeded its memory limit of 384m"):
+        mgr._wait_for_ready(_container(status="exited", oom=True), spec, timeout=30)
 
 
 def test_ready_timeout_defaults_to_the_setting():
