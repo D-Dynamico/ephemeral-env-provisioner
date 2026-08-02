@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.auth import API_KEY_HEADER, api_key_map
 from api.routes.environment_router import router as env_router
+from api.routes.metrics_router import router as metrics_router
 from config import settings
 from observability import get_logger
 
@@ -56,6 +57,7 @@ if settings.cors_origin_list:
     )
 
 app.include_router(env_router)
+app.include_router(metrics_router)
 
 @app.get("/health", tags=["meta"])
 async def health():

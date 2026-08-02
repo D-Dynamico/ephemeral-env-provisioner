@@ -170,6 +170,7 @@ CORS sends no headers unless `CORS_ALLOW_ORIGINS` lists origins explicitly.
 | `GET` | `/environments/` | The caller's environments. Filter by `status`; `limit` / `offset` |
 | `GET` | `/environments/{id}` | Poll for status. `404` for another principal's environment |
 | `DELETE` | `/environments/{id}` | `202`, triggers teardown |
+| `GET` | `/metrics` | Prometheus exposition for the API process. Requires a key |
 | `GET` | `/health` | Open, no key |
 
 ```bash
@@ -226,8 +227,57 @@ Resolved template `environment` values carry credentials and are never logged,
 at any level. A test asserts it against the provisioning path's actual log
 calls.
 
-This is logging, not monitoring: there are no metrics, no `/metrics` endpoint
-and no alerting.
+## Metrics
+
+Three metrics, in Prometheus exposition format:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `provision_total` | counter | `template`, `outcome` |
+| `teardown_total` | counter | `outcome` |
+| `provision_duration_seconds` | histogram | `template` |
+
+`outcome` is `success`, `failure` or `retry`. `retry` is deliberately separate:
+both tasks retry, so counting a transient Docker error that resolved on the
+second attempt as a failure would misreport it as a lost environment. The
+histogram records successful provisions only — a failure's duration comes from
+a different distribution, and merging the two makes the percentiles describe
+neither.
+
+**There are two scrape targets.** Outcomes are only knowable in the worker, and
+the HTTP surface is the API; they are separate containers with separate
+registries, so no single endpoint can serve both.
+
+| Target | Address | Auth |
+|---|---|---|
+| API | `/metrics` on port 8000 | `X-API-Key` |
+| Worker | port 9100, compose network only | **none available** |
+
+```bash
+curl -H "X-API-Key: $API_KEY" http://localhost:8000/metrics
+docker compose exec worker python -c \
+  "import urllib.request; print(urllib.request.urlopen('http://localhost:9100/metrics').read().decode())"
+```
+
+The worker's exporter is `prometheus_client`'s own HTTP server, which has no
+hook for authentication. It is therefore never published to the host — it is
+reachable only from inside the compose network. That is an asymmetry with the
+posture the rest of the service takes, not a solved problem.
+
+The worker runs a prefork pool, so the process answering a scrape is not the
+one that counted anything. `PROMETHEUS_MULTIPROC_DIR` (set on the worker in
+`docker-compose.yml`) gives the children a shared directory to mmap into and
+the parent serves the sum; without it every increment is lost when its child
+exits.
+
+No metric is labelled by `env_id` or `owner`. Each would add one time series
+per environment forever, and `owner` would put a principal's identity into an
+endpoint that exists to be read by something else. A test asserts the label
+sets rather than trusting the call sites.
+
+This exposes metrics; it is not monitoring. There is no Prometheus server, no
+Grafana and no alerting in this repo — the same line the ingress items sit on
+under *What it is not*.
 
 ## Migrations
 
@@ -248,7 +298,8 @@ Alembic owns the schema. Run these inside the compose network
 │   ├── main.py                       # FastAPI app + lifespan
 │   ├── auth.py                       # API-key → principal, fail-closed
 │   ├── routes/
-│   │   └── environment_router.py     # Environment endpoints
+│   │   ├── environment_router.py     # Environment endpoints
+│   │   └── metrics_router.py         # /metrics, behind X-API-Key
 │   └── schemas/
 │       └── environment_schema.py     # Pydantic request/response models
 ├── worker/
@@ -283,8 +334,9 @@ Alembic owns the schema. Run these inside the compose network
 Containers are bounded on CPU, memory and PIDs. They are **not** bounded on disk
 or network bandwidth — both remain denial-of-service vectors against the host.
 
-There are no metrics. Logs are structured and correlated, but nothing counts
-provisions or measures how long they take.
+Logs are structured and correlated by `env_id`, and provisions and teardowns
+are counted and timed. Both are exposed, not collected: nothing in this repo
+scrapes, stores or alerts on them.
 
 The service requires access to the Docker socket, which is root-equivalent on
 the host. Authentication is a static API-key allowlist (see below) — enough that

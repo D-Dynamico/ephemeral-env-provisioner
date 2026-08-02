@@ -351,3 +351,36 @@ def test_multiproc_dir_is_created_when_absent(monkeypatch, tmp_path):
 
     assert prepare_multiproc_dir() == str(target)
     assert os.path.isdir(target)
+
+
+# ── /metrics on the API ───────────────────────────────────────────────────────
+
+async def test_metrics_requires_a_key(anon_client):
+    """
+    Consistent with every other route that is not /health. The endpoint is not
+    especially sensitive, but §9's posture is that this service does not grow
+    an unauthenticated surface by default.
+    """
+    response = await anon_client.get("/metrics")
+    assert response.status_code == 401
+
+
+async def test_metrics_returns_the_exposition_format(client):
+    response = await client.get("/metrics")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "# TYPE provision_total counter" in response.text
+
+
+async def test_metrics_never_exposes_an_env_id_or_owner(client):
+    """
+    Belt and braces over the label-name test: this reads the rendered output,
+    so a metric added later that interpolates an id into a *value* is caught
+    too. The principal's own address is the one identifier certain to be in
+    scope during this test.
+    """
+    response = await client.get("/metrics")
+
+    assert "env_id" not in response.text
+    assert "dev@example.com" not in response.text
