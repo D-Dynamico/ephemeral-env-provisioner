@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 from celery import Celery
-from celery.signals import setup_logging
+from celery.signals import setup_logging, worker_init, worker_process_shutdown
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -20,8 +20,11 @@ from docker_manager.compose import docker_manager
 from metrics import (
     UNKNOWN_TEMPLATE,
     Outcome,
+    mark_worker_process_dead,
+    prepare_multiproc_dir,
     provision_duration_seconds,
     provision_total,
+    start_worker_metrics_server,
     teardown_total,
 )
 from observability import bind_env_id, configure_logging, get_logger
@@ -37,6 +40,32 @@ def _use_our_logging(**_kwargs) -> None:
     what stops it, so the worker's own lines render like everything else.
     """
     configure_logging()
+
+
+@worker_init.connect
+def _serve_metrics(**_kwargs) -> None:
+    """
+    Fires in the parent, before the prefork pool forks.
+
+    The order matters. The directory is wiped first, so the pool cannot start
+    writing into files left by the previous run — a counter that resurrects its
+    old total reads as a burst of real traffic to anything computing a rate.
+    The server then serves the aggregate of whatever the children go on to
+    write, which is the only reason it runs in the parent: the parent itself
+    executes no tasks and has nothing of its own to report.
+
+    Beat imports this module too and never receives this signal, so it does not
+    try to bind the same port.
+    """
+    prepare_multiproc_dir()
+    start_worker_metrics_server(settings.worker_metrics_port)
+
+
+@worker_process_shutdown.connect
+def _release_metrics_files(pid=None, **_kwargs) -> None:
+    """Drop a finished child's gauge files. Its counters stay (see metrics.py)."""
+    mark_worker_process_dead(pid)
+
 
 # ── Celery app ─────────────────────────────────────────────────────────────────
 

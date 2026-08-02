@@ -9,6 +9,7 @@ endpoint meant to be scraped by something else (CLAUDE.md §9). Nothing else in
 the test suite would notice.
 """
 
+import os
 from unittest.mock import patch
 
 import pytest
@@ -24,9 +25,12 @@ from docker_manager.compose import StackResult
 from metrics import (
     ALL_METRICS,
     FORBIDDEN_LABELS,
+    MULTIPROC_ENV_VAR,
     OUTCOMES,
     UNKNOWN_TEMPLATE,
     Outcome,
+    mark_worker_process_dead,
+    prepare_multiproc_dir,
     provision_duration_seconds,
     provision_total,
     render_latest,
@@ -301,3 +305,49 @@ def test_running_a_task_twice_counts_twice(sync_sessions):
     assert _count(
         "provision_total", template=TEMPLATE, outcome=Outcome.SUCCESS
     ) == before + 2
+
+
+# ── Multiprocess mode ─────────────────────────────────────────────────────────
+# Only the worker runs in multiprocess mode. These cover the directory
+# handling; that the parent's server actually sums two children's counts is not
+# reachable from a single-process test suite and is verified against the real
+# stack instead.
+
+def test_multiproc_dir_is_skipped_when_not_configured(monkeypatch):
+    """
+    The normal case under pytest and for a bare local `celery` run. Returning
+    None rather than inventing a directory is what keeps single-process mode
+    working with no configuration.
+    """
+    monkeypatch.delenv(MULTIPROC_ENV_VAR, raising=False)
+    assert prepare_multiproc_dir() is None
+    # Must not raise either, or every child exit in single-process mode would.
+    mark_worker_process_dead(1234)
+
+
+def test_multiproc_dir_is_created_empty(monkeypatch, tmp_path):
+    """
+    Wiping is the point. The files outlive the worker, so a restart that
+    collected them would serve the previous run's totals as current — and a
+    counter that jumps reads as real traffic to anything computing a rate.
+    """
+    target = tmp_path / "multiproc"
+    target.mkdir()
+    stale = target / "counter_99.db"
+    stale.write_bytes(b"leftover from the previous run")
+
+    monkeypatch.setenv(MULTIPROC_ENV_VAR, str(target))
+    returned = prepare_multiproc_dir()
+
+    assert returned == str(target)
+    assert os.path.isdir(target)
+    assert not stale.exists()
+    assert os.listdir(target) == []
+
+
+def test_multiproc_dir_is_created_when_absent(monkeypatch, tmp_path):
+    target = tmp_path / "does-not-exist-yet"
+    monkeypatch.setenv(MULTIPROC_ENV_VAR, str(target))
+
+    assert prepare_multiproc_dir() == str(target)
+    assert os.path.isdir(target)

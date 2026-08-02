@@ -52,6 +52,16 @@ services:
       dockerfile: Dockerfile
     command: celery -A worker.tasks worker --loglevel=info --concurrency=2
     env_file: .env
+    environment:
+      # Read by prometheus_client itself. The pool is prefork, so each child
+      # counts in its own memory; without a shared directory to mmap into,
+      # every increment dies with the child that made it. Kept off the bind
+      # mount at /app deliberately — these files are process state, not source.
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus-multiproc
+    # Not published to the host. This endpoint has no authentication available
+    # to it, unlike the API's /metrics, so it stays inside the compose network.
+    expose:
+      - "9100"
     volumes:
       - .:/app
       - //var/run/docker.sock:/var/run/docker.sock
