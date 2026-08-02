@@ -100,10 +100,10 @@ mount.
 
 `webapp-postgres` is two containers on their own bridge network:
 
-| Role | Image | Notes |
-|---|---|---|
-| `db` | `postgres:16-alpine` | Internal only, no host port. Healthcheck: `pg_isready` |
-| `app` | `provisioner/demo-app:1` | Built from `templates/demo-app`. Mapped to a random host port |
+| Role | Image | Memory | CPU | Notes |
+|---|---|---|---|---|
+| `db` | `postgres:16-alpine` | 256m | 0.5 | Internal only, no host port. Healthcheck: `pg_isready` |
+| `app` | `provisioner/demo-app:1` | 384m | 0.5 | Built from `templates/demo-app`. Mapped to a random host port |
 
 The app writes to the database in **its own** environment: open it and each
 reload records a visit, so the count starts at zero in every new environment.
@@ -119,6 +119,17 @@ Each role can declare a healthcheck. Provisioning waits for one role to report
 healthy before starting the role that depends on it — Postgres accepts
 connections several seconds after its container reports `running`, and an app
 that connects on boot would otherwise race it.
+
+Every container carries a CPU, memory and PID ceiling. A template role may tune
+them; it cannot opt out, so an unbounded container is not reachable through the
+template allowlist. The defaults live in `config.py`
+(`DEFAULT_CONTAINER_MEMORY_LIMIT`, `DEFAULT_CONTAINER_CPU_LIMIT`,
+`DEFAULT_CONTAINER_PIDS_LIMIT`) and apply to any role that stays silent.
+
+The limits bound the host, not just the environment: `webapp-postgres` costs
+1.0 core and 640m per environment, so the five-environment quota caps one
+principal at 5 cores and ~3.2GB. Swap is pinned to the memory limit, so the
+ceiling cannot be evaded by swapping.
 
 Changing the app means rebuilding and re-tagging its image. The provisioner
 starts pre-existing images and does not build (see *What it is not*).

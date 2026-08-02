@@ -94,6 +94,34 @@ def resolve_environment(env_id: str, spec: dict, roles: list[str]) -> dict[str, 
     return resolved
 
 
+def resource_limits(spec: dict) -> dict:
+    """
+    Per-container CPU, memory and PID ceilings for a template spec.
+
+    Always returns all four kwargs. A spec may tune `memory_limit`, `cpu_limit`
+    or `pids_limit`, but omitting them yields the settings defaults rather than
+    an unlimited container: §9 treats an unbounded provisioner as a denial of
+    service against its own host, and a template that could opt out silently
+    would reopen that.
+
+    `memswap_limit` is pinned to `mem_limit` so the ceiling cannot be evaded by
+    swapping. Docker reads equal values as "no swap beyond RAM".
+
+    Cores are converted to `nano_cpus`, a hard quota rather than a relative
+    share — it applies even when the host is otherwise idle.
+    """
+    memory = spec.get("memory_limit", settings.default_container_memory_limit)
+    cores = spec.get("cpu_limit", settings.default_container_cpu_limit)
+    pids = spec.get("pids_limit", settings.default_container_pids_limit)
+
+    return {
+        "mem_limit": memory,
+        "memswap_limit": memory,
+        "nano_cpus": int(cores * 1_000_000_000),
+        "pids_limit": pids,
+    }
+
+
 def to_docker_healthcheck(spec_healthcheck: dict) -> dict:
     """
     Translate a template's healthcheck into the Docker API's shape.
@@ -149,6 +177,11 @@ TEMPLATES: dict[str, list[dict]] = {
             },
             "expose_port": None,       # internal only
             "internal_port": 5432,
+            # postgres:16-alpine ships shared_buffers=128MB and does not tune it
+            # down; with backend processes on top, a single-client environment
+            # sits near 150-180MB. 256m is that plus headroom.
+            "memory_limit": "256m",
+            "cpu_limit": 0.5,
             # Postgres accepts connections some seconds after the container
             # reports "running". Anything that connects on boot must wait for
             # this, not for the process to exist.
@@ -174,6 +207,11 @@ TEMPLATES: dict[str, list[dict]] = {
             "expose_port": 8000,        # this port gets mapped to a random host port
             "internal_port": 8000,
             "depends_on_role": "db",    # start db first
+            # uvicorn + FastAPI + psycopg 3 idles around 60-90MB RSS. The
+            # headroom is for the request path, and for CPython returning memory
+            # to the OS reluctantly — the high-water mark is what gets killed.
+            "memory_limit": "384m",
+            "cpu_limit": 0.5,
             "healthcheck": {
                 # Checks the database too, so `healthy` means actually usable.
                 # Uses python rather than curl: the slim image has no curl.
@@ -357,14 +395,16 @@ class DockerManager:
             # Map container port → random host port (Docker picks it)
             ports = {f"{spec['expose_port']}/tcp": None}
 
-        kwargs: dict = {}
+        # Limits are not conditional. Every container this service starts gets a
+        # ceiling (§9); the spec only chooses the numbers.
+        kwargs: dict = resource_limits(spec)
         if spec.get("healthcheck"):
             kwargs["healthcheck"] = to_docker_healthcheck(spec["healthcheck"])
 
         try:
             container: Container = self.client.containers.run(
                 image=spec["image"],
-            name=container_name(env_id, role),
+                name=container_name(env_id, role),
                 detach=True,
                 network=network.name,
                 environment=environment,

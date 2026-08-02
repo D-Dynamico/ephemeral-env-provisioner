@@ -16,6 +16,7 @@ from docker_manager.compose import (
     container_name,
     network_name,
     resolve_environment,
+    resource_limits,
     to_docker_healthcheck,
 )
 
@@ -151,6 +152,64 @@ def test_shipped_healthchecks_translate():
         for spec in template:
             if spec.get("healthcheck"):
                 assert "test" in to_docker_healthcheck(spec["healthcheck"])
+
+
+# ── Resource limits (§9) ───────────────────────────────────────────────────────
+
+def test_limits_fall_back_to_the_settings_defaults():
+    """A spec that says nothing still gets a ceiling, never an unlimited one."""
+    limits = resource_limits({"role": "app"})
+
+    assert limits["mem_limit"] == settings.default_container_memory_limit
+    assert limits["nano_cpus"] == int(settings.default_container_cpu_limit * 1_000_000_000)
+    assert limits["pids_limit"] == settings.default_container_pids_limit
+
+
+def test_spec_overrides_win_and_cores_become_nano_cpus():
+    limits = resource_limits({"memory_limit": "256m", "cpu_limit": 0.5, "pids_limit": 64})
+
+    assert limits["mem_limit"] == "256m"
+    assert limits["nano_cpus"] == 500_000_000
+    assert limits["pids_limit"] == 64
+
+
+def test_swap_cannot_be_used_to_evade_the_memory_limit():
+    limits = resource_limits({"memory_limit": "256m"})
+    assert limits["memswap_limit"] == limits["mem_limit"]
+
+
+def test_every_role_in_every_template_is_bounded():
+    """
+    Guards the next template added. An unbounded container is a denial of
+    service against this service's own host (§9).
+    """
+    for name, template in TEMPLATES.items():
+        for spec in template:
+            limits = resource_limits(spec)
+            where = f"template {name!r}, role {spec['role']!r}"
+            assert limits["mem_limit"], where
+            assert limits["nano_cpus"] > 0, where
+            assert limits["pids_limit"] > 0, where
+
+
+def test_start_container_passes_limits_to_docker():
+    """
+    The helper is only a guard if its output actually reaches `containers.run`.
+    """
+    mgr = DockerManager()
+    mgr._client = MagicMock()
+    network = MagicMock()
+    network.name = network_name(ENV_ID)
+    spec = {"role": "db", "image": "postgres:16-alpine", "memory_limit": "256m",
+            "cpu_limit": 0.5}
+
+    mgr._start_container(env_id=ENV_ID, spec=spec, network=network, environment={})
+
+    kwargs = mgr._client.containers.run.call_args.kwargs
+    assert kwargs["mem_limit"] == "256m"
+    assert kwargs["memswap_limit"] == "256m"
+    assert kwargs["nano_cpus"] == 500_000_000
+    assert kwargs["pids_limit"] == settings.default_container_pids_limit
 
 
 # ── Readiness ──────────────────────────────────────────────────────────────────

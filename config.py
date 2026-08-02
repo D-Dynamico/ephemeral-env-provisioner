@@ -49,6 +49,17 @@ class Settings(BaseSettings):
     max_environments_per_user: int = 5
     base_port: int = 20000
 
+    # Per-container resource ceilings. These are a denial-of-service guard, not
+    # a bin-packing budget: the quota bounds how many environments a principal
+    # runs, not what each one consumes (§9). A template may tune them per role
+    # but cannot opt out — `resource_limits` always returns all three.
+    #
+    # Set them near real usage and a normal provision becomes an OOM kill, which
+    # fails the row. Headroom is deliberate.
+    default_container_memory_limit: str = "512m"
+    default_container_cpu_limit: float = 1.0    # cores; converted to nano_cpus
+    default_container_pids_limit: int = 256     # fork-bomb ceiling
+
     # Reconciliation
     reap_interval_seconds: int = 60
     orphan_sweep_interval_seconds: int = 300
