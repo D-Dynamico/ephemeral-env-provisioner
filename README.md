@@ -204,6 +204,31 @@ API contract, the guards, the state machine and the sweeps, but **not**
 `DockerManager`, which is the only component that can fail in a way that costs
 real resources.
 
+## Logs
+
+All three processes — API, worker, beat — share one configuration in
+`observability.py`. JSON by default, human-readable only when
+`APP_ENV=development`.
+
+Every line emitted while a task runs carries `env_id` as a **field**, not as a
+message prefix, so one environment's whole lifecycle is a filter rather than a
+grep:
+
+```bash
+docker compose logs worker | grep '"env_id": "<id>"'
+```
+
+The id is bound as a contextvar, so lines from `docker_manager` are correlated
+too even though it never receives the id as something to log. Events are named
+(`provision.started`, `container.removed`) with values in fields.
+
+Resolved template `environment` values carry credentials and are never logged,
+at any level. A test asserts it against the provisioning path's actual log
+calls.
+
+This is logging, not monitoring: there are no metrics, no `/metrics` endpoint
+and no alerting.
+
 ## Migrations
 
 ```bash
@@ -243,16 +268,21 @@ Alembic owns the schema. Run these inside the compose network
 │   ├── conftest.py                   # SQLite fixtures + authenticated clients
 │   ├── test_auth.py
 │   ├── test_templates.py
+│   ├── test_observability.py
 │   └── test_environments.py
 ├── config.py                         # Pydantic settings
+├── observability.py                  # Shared structlog config + env_id binding
 ├── docker-compose.yml                # postgres, redis, api, worker, beat
 └── Dockerfile
 ```
 
 ## Status
 
-There are no container CPU or memory limits yet. The quota bounds how many
-environments a principal can run, not what each one consumes.
+Containers are bounded on CPU, memory and PIDs. They are **not** bounded on disk
+or network bandwidth — both remain denial-of-service vectors against the host.
+
+There are no metrics. Logs are structured and correlated, but nothing counts
+provisions or measures how long they take.
 
 The service requires access to the Docker socket, which is root-equivalent on
 the host. Authentication is a static API-key allowlist (see below) — enough that

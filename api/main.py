@@ -1,5 +1,3 @@
-import structlog
-import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -8,11 +6,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.auth import API_KEY_HEADER, api_key_map
 from api.routes.environment_router import router as env_router
 from config import settings
+from observability import get_logger
 
-structlog.configure(
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-)
-log = structlog.get_logger()
+# Configuration lives in observability.py so the API, the worker and beat all
+# render the same shape. It used to be configured here, which meant only this
+# process had it.
+log = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

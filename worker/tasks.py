@@ -5,19 +5,30 @@ Run with:
     celery -A worker.tasks worker --loglevel=info
 """
 
-import logging
 import uuid
 from datetime import datetime, timezone, timedelta
 
 from celery import Celery
+from celery.signals import setup_logging
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from config import settings
 from db.models import Environment, EnvironmentStatus
 from docker_manager.compose import docker_manager
+from observability import bind_env_id, configure_logging, get_logger
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
+
+
+@setup_logging.connect
+def _use_our_logging(**_kwargs) -> None:
+    """
+    Celery replaces the root logger's handlers on startup unless something
+    answers this signal. Answering it — even with our own configuration — is
+    what stops it, so the worker's own lines render like everything else.
+    """
+    configure_logging()
 
 # ── Celery app ─────────────────────────────────────────────────────────────────
 
@@ -89,7 +100,7 @@ def _mark_failed(db: Session, env_id: str, message: str) -> None:
             env.error_message = message[:500]
             db.commit()
     except Exception:
-        log.exception("[%s] Could not mark environment FAILED", env_id)
+        log.exception("environment.mark_failed_error")
 
 
 # ── Tasks ──────────────────────────────────────────────────────────────────────
@@ -101,53 +112,59 @@ def provision_environment(self, env_id: str) -> dict:
     Updates environment status in the DB as it progresses.
     """
     db = get_sync_db()
-    try:
-        env: Environment = _load_env(db, env_id)
-        if not env:
-            raise ValueError(f"Environment {env_id} not found")
+    # Everything below — including lines from docker_manager — is tagged with
+    # this env_id, so one provision is a filter rather than a grep.
+    with bind_env_id(env_id):
+        try:
+            env: Environment = _load_env(db, env_id)
+            if not env:
+                raise ValueError(f"Environment {env_id} not found")
 
-        # ── Transition: pending → provisioning ─────────────────────────────
-        env.set_status(EnvironmentStatus.PROVISIONING)
-        db.commit()
-        log.info("[%s] Starting provisioning (template=%s)", env_id, env.template)
+            # ── Transition: pending → provisioning ─────────────────────────────
+            env.set_status(EnvironmentStatus.PROVISIONING)
+            db.commit()
+            log.info("provision.started", template=env.template)
 
-        # ── Spin up Docker stack ────────────────────────────────────────────
-        result = docker_manager.provision(
-            env_id=str(env.id),
-            template_name=env.template,
-        )
+            # ── Spin up Docker stack ────────────────────────────────────────────
+            result = docker_manager.provision(
+                env_id=str(env.id),
+                template_name=env.template,
+            )
 
-        # ── Transition: provisioning → running ─────────────────────────────
-        now = datetime.now(timezone.utc)
-        env.set_status(EnvironmentStatus.RUNNING)
-        env.network_id = result.network_id
-        env.container_ids = result.container_ids
-        env.host_port = result.host_port
-        env.started_at = now
-        env.expires_at = now + timedelta(seconds=env.ttl_seconds)
-        db.commit()
+            # ── Transition: provisioning → running ─────────────────────────────
+            now = datetime.now(timezone.utc)
+            env.set_status(EnvironmentStatus.RUNNING)
+            env.network_id = result.network_id
+            env.container_ids = result.container_ids
+            env.host_port = result.host_port
+            env.started_at = now
+            env.expires_at = now + timedelta(seconds=env.ttl_seconds)
+            db.commit()
 
-        log.info(
-            "[%s] Running on host port %d, expires at %s",
-            env_id, result.host_port, env.expires_at
-        )
-        return {
-            "env_id": env_id,
-            "host_port": result.host_port,
-            "status": "running",
-        }
+            log.info(
+                "provision.running",
+                template=env.template,
+                host_port=result.host_port,
+                container_count=len(result.container_ids),
+                expires_at=env.expires_at.isoformat(),
+            )
+            return {
+                "env_id": env_id,
+                "host_port": result.host_port,
+                "status": "running",
+            }
 
-    except Exception as exc:
-        log.exception("[%s] Provisioning failed: %s", env_id, exc)
-        _mark_failed(db, env_id, str(exc))
+        except Exception as exc:
+            log.exception("provision.failed", error=str(exc))
+            _mark_failed(db, env_id, str(exc))
 
-        # Retry with exponential backoff unless it's a value error
-        if not isinstance(exc, ValueError):
-            raise self.retry(exc=exc, countdown=2 ** self.request.retries * 10)
-        raise
+            # Retry with exponential backoff unless it's a value error
+            if not isinstance(exc, ValueError):
+                raise self.retry(exc=exc, countdown=2 ** self.request.retries * 10)
+            raise
 
-    finally:
-        db.close()
+        finally:
+            db.close()
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=5)
@@ -156,43 +173,46 @@ def teardown_environment(self, env_id: str) -> dict:
     Stop and remove all Docker resources for an environment.
     """
     db = get_sync_db()
-    try:
-        env: Environment = _load_env(db, env_id)
-        if not env:
-            raise ValueError(f"Environment {env_id} not found")
+    with bind_env_id(env_id):
+        try:
+            env: Environment = _load_env(db, env_id)
+            if not env:
+                raise ValueError(f"Environment {env_id} not found")
 
-        # ── Transition: running → stopping ─────────────────────────────────
-        env.set_status(EnvironmentStatus.STOPPING)
-        db.commit()
-        log.info("[%s] Starting teardown", env_id)
+            # ── Transition: running → stopping ─────────────────────────────────
+            env.set_status(EnvironmentStatus.STOPPING)
+            db.commit()
+            log.info("teardown.started")
 
-        docker_manager.teardown(
-            env_id=str(env.id),
-            container_ids=env.container_ids or [],
-            network_id=env.network_id,
-        )
+            docker_manager.teardown(
+                env_id=str(env.id),
+                container_ids=env.container_ids or [],
+                network_id=env.network_id,
+            )
 
-        # ── Transition: stopping → stopped ─────────────────────────────────
-        env.set_status(EnvironmentStatus.STOPPED)
-        env.stopped_at = datetime.now(timezone.utc)
-        db.commit()
+            # ── Transition: stopping → stopped ─────────────────────────────────
+            env.set_status(EnvironmentStatus.STOPPED)
+            env.stopped_at = datetime.now(timezone.utc)
+            db.commit()
 
-        log.info("[%s] Teardown complete", env_id)
-        return {"env_id": env_id, "status": "stopped"}
+            log.info("teardown.complete")
+            return {"env_id": env_id, "status": "stopped"}
 
-    except Exception as exc:
-        log.exception("[%s] Teardown failed: %s", env_id, exc)
-        # self.retry() raises out of this block, so the exhaustion check has to
-        # happen before the call — it cannot be caught by the same try.
-        if self.request.retries >= self.max_retries:
-            # Last attempt. Without this the row sits in STOPPING forever with
-            # no task left to move it, and the reaper only scans RUNNING.
-            _mark_failed(db, env_id, f"Teardown failed: {exc}")
-            raise
-        raise self.retry(exc=exc)
+        except Exception as exc:
+            log.exception(
+                "teardown.failed", error=str(exc), attempt=self.request.retries
+            )
+            # self.retry() raises out of this block, so the exhaustion check has to
+            # happen before the call — it cannot be caught by the same try.
+            if self.request.retries >= self.max_retries:
+                # Last attempt. Without this the row sits in STOPPING forever with
+                # no task left to move it, and the reaper only scans RUNNING.
+                _mark_failed(db, env_id, f"Teardown failed: {exc}")
+                raise
+            raise self.retry(exc=exc)
 
-    finally:
-        db.close()
+        finally:
+            db.close()
 
 
 @celery_app.task
@@ -221,7 +241,8 @@ def reap_expired_environments() -> dict:
 
         for env in expired:
             teardown_environment.delay(str(env.id))
-            log.info("[%s] TTL expired — teardown enqueued", env.id)
+            with bind_env_id(env.id):
+                log.info("reap.enqueued_teardown", expires_at=env.expires_at.isoformat())
 
         return {"reaped": len(expired)}
 
@@ -263,7 +284,7 @@ def reconcile_orphans() -> dict:
                 env = _load_env(db, env_id)
             except (ValueError, AttributeError):
                 # Label is not a UUID — not ours to reason about. Leave it.
-                log.warning("Skipping unparseable env_id label: %r", env_id)
+                log.warning("orphan.unparseable_label", label=repr(env_id))
                 skipped += 1
                 continue
 
@@ -271,16 +292,18 @@ def reconcile_orphans() -> dict:
                 skipped += 1
                 continue
 
-            reason = "no DB row" if env is None else f"status={env.status.value}"
-            log.info(
-                "[%s] Orphaned resources (%s): %d container(s), %d network(s)",
-                env_id, reason, len(res.container_ids), len(res.network_ids),
-            )
-            docker_manager.remove_resources(
-                env_id=env_id,
-                container_ids=res.container_ids,
-                network_ids=res.network_ids,
-            )
+            with bind_env_id(env_id):
+                log.info(
+                    "orphan.removing",
+                    reason="no_db_row" if env is None else env.status.value,
+                    container_count=len(res.container_ids),
+                    network_count=len(res.network_ids),
+                )
+                docker_manager.remove_resources(
+                    env_id=env_id,
+                    container_ids=res.container_ids,
+                    network_ids=res.network_ids,
+                )
             removed += 1
 
         return {"removed": removed, "skipped": skipped}
@@ -326,10 +349,12 @@ def recover_stale_transitions() -> dict:
             ).all()
 
             for env in stale:
-                log.warning(
-                    "[%s] Stuck in %s for over %ds — presuming the worker died",
-                    env.id, status.value, timeout,
-                )
+                with bind_env_id(env.id):
+                    log.warning(
+                        "stale.presumed_dead",
+                        stuck_in=status.value,
+                        timeout_seconds=timeout,
+                    )
                 env.set_status(EnvironmentStatus.FAILED)
                 env.error_message = (
                     f"Presumed dead: stuck in {status.value} for over {timeout}s"

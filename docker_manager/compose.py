@@ -5,7 +5,6 @@ isolated stacks for each environment.
 Phase 1: single-container webapp + postgres, port-mapped to host.
 """
 
-import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -17,8 +16,12 @@ from docker.models.containers import Container
 from docker.models.networks import Network
 
 from config import settings
+from observability import bind_env_id, get_logger
 
-log = logging.getLogger(__name__)
+# Lines from this module carry the `env_id` bound by the calling task, so a
+# provision can be followed across the worker and the Docker layer without the
+# id being threaded through every signature.
+log = get_logger(__name__)
 
 # Every resource this service creates carries this label. It is the only way to
 # find resources again when the DB has no record of them (invariant 3), so the
@@ -257,7 +260,7 @@ class DockerManager:
             raise ValueError(f"Unknown template: {template_name!r}")
 
         network = self._create_network(env_id)
-        log.info("Created network %s for env %s", network.id, env_id)
+        log.info("network.created", network_id=network.id[:12])
 
         container_ids: list[str] = []
         host_port: int | None = None
@@ -276,7 +279,7 @@ class DockerManager:
             )
             container_ids.append(container.id)
             role_to_container[spec["role"]] = container
-            log.info("Started container %s (role=%s)", container.short_id, spec["role"])
+            log.info("container.started", container_id=container.short_id, role=spec["role"])
 
             # Wait before starting the next role, not after starting them all.
             # The dependency order is only meaningful if the dependency is
@@ -318,27 +321,36 @@ class DockerManager:
         gone is a no-op, not an error (invariant 2). Containers are removed
         before networks, since a network with an attached container cannot be
         removed.
-        """
-        for cid in container_ids:
-            try:
-                container = self.client.containers.get(cid)
-                container.stop(timeout=10)
-                container.remove(force=True)
-                log.info("Removed container %s (env=%s)", cid[:12], env_id)
-            except docker.errors.NotFound:
-                log.warning("Container %s already gone", cid[:12])
-            except Exception as exc:
-                log.error("Error removing container %s: %s", cid[:12], exc)
 
-        for nid in network_ids:
-            try:
-                network = self.client.networks.get(nid)
-                network.remove()
-                log.info("Removed network %s (env=%s)", nid[:12], env_id)
-            except docker.errors.NotFound:
-                pass
-            except Exception as exc:
-                log.error("Error removing network %s: %s", nid[:12], exc)
+        Binds `env_id` itself rather than relying on the caller: the orphan
+        sweep removes resources for many environments in one task, so a single
+        bind around the whole task would mislabel them.
+        """
+        with bind_env_id(env_id):
+            for cid in container_ids:
+                try:
+                    container = self.client.containers.get(cid)
+                    container.stop(timeout=10)
+                    container.remove(force=True)
+                    log.info("container.removed", container_id=cid[:12])
+                except docker.errors.NotFound:
+                    log.warning("container.already_gone", container_id=cid[:12])
+                except Exception as exc:
+                    log.error(
+                        "container.remove_failed", container_id=cid[:12], error=str(exc)
+                    )
+
+            for nid in network_ids:
+                try:
+                    network = self.client.networks.get(nid)
+                    network.remove()
+                    log.info("network.removed", network_id=nid[:12])
+                except docker.errors.NotFound:
+                    pass
+                except Exception as exc:
+                    log.error(
+                        "network.remove_failed", network_id=nid[:12], error=str(exc)
+                    )
 
     def find_labelled(self, min_age_seconds: int = 0) -> dict[str, LabelledResources]:
         """
