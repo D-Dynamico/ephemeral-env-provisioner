@@ -9,13 +9,23 @@ endpoint meant to be scraped by something else (CLAUDE.md §9). Nothing else in
 the test suite would notice.
 """
 
-from prometheus_client import CONTENT_TYPE_LATEST
+from unittest.mock import patch
 
+import pytest
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+import worker.tasks as worker_tasks
 from config import settings
+from db.models import Base, Environment, EnvironmentStatus
+from docker_manager.compose import StackResult
 from metrics import (
     ALL_METRICS,
     FORBIDDEN_LABELS,
     OUTCOMES,
+    UNKNOWN_TEMPLATE,
     Outcome,
     provision_duration_seconds,
     provision_total,
@@ -86,3 +96,208 @@ def test_duration_buckets_span_the_container_ready_timeout():
     # The default buckets stop at 10s, which is roughly one observed provision.
     assert max(finite) > 10
     assert bounds[-1] == float("inf")
+
+
+# ── Increments ────────────────────────────────────────────────────────────────
+# The metrics are process-global and accumulate across the whole session, so
+# every assertion below is a delta. Absolute values would couple these tests to
+# their execution order.
+
+TEMPLATE = "webapp-postgres"
+
+
+def _count(name: str, **labels) -> float:
+    return REGISTRY.get_sample_value(name, labels) or 0.0
+
+
+def _duration_count(template: str) -> float:
+    return _count("provision_duration_seconds_count", template=template)
+
+
+@pytest.fixture
+def sync_sessions():
+    """Sync SQLite, as the worker uses sync SQLAlchemy (mirrors test_environments)."""
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    yield sessionmaker(bind=engine, expire_on_commit=False)
+    engine.dispose()
+
+
+def _make_env(sessions, name: str) -> str:
+    session = sessions()
+    env = Environment(
+        name=name,
+        owner="dev@example.com",
+        template=TEMPLATE,
+        status=EnvironmentStatus.PENDING,
+        ttl_seconds=300,
+    )
+    session.add(env)
+    session.commit()
+    env_id = str(env.id)
+    session.close()
+    return env_id
+
+
+def _stack() -> StackResult:
+    return StackResult(network_id="net123", container_ids=["c1", "c2"], host_port=32768)
+
+
+def _run_task(task, env_id: str, sessions, method: str, impl, retries: int = 0):
+    """
+    Run a task body at a chosen retry count, with one DockerManager method stubbed.
+
+    `push_request` is what makes the attempt look like the Nth: calling the task
+    directly would push its own request and reset retries to 0, which is the
+    difference between the `retry` and `failure` outcomes.
+    """
+    task.push_request(retries=retries)
+    try:
+        with patch.object(worker_tasks, "get_sync_db", lambda: sessions()), \
+             patch.object(worker_tasks.docker_manager, method, side_effect=impl):
+            return task.run(env_id)
+    finally:
+        task.pop_request()
+
+
+def test_provision_success_counts_and_times(sync_sessions):
+    env_id = _make_env(sync_sessions, "ok-env")
+    before = _count("provision_total", template=TEMPLATE, outcome=Outcome.SUCCESS)
+    before_timed = _duration_count(TEMPLATE)
+
+    _run_task(
+        worker_tasks.provision_environment, env_id, sync_sessions,
+        "provision", lambda **kw: _stack(),
+    )
+
+    assert _count(
+        "provision_total", template=TEMPLATE, outcome=Outcome.SUCCESS
+    ) == before + 1
+    assert _duration_count(TEMPLATE) == before_timed + 1
+
+
+def test_provision_failure_with_attempts_left_counts_as_retry(sync_sessions):
+    env_id = _make_env(sync_sessions, "flaky-env")
+    before = _count("provision_total", template=TEMPLATE, outcome=Outcome.RETRY)
+    before_failed = _count("provision_total", template=TEMPLATE, outcome=Outcome.FAILURE)
+
+    def boom(**_kw):
+        raise RuntimeError("docker daemon unreachable")
+
+    # A task invoked directly rather than dispatched by a worker has
+    # `called_directly` set, and Celery's retry() re-raises the original
+    # exception instead of Retry. The classification under test happens before
+    # that call, so what surfaces here does not affect what was counted.
+    with pytest.raises(RuntimeError):
+        _run_task(
+            worker_tasks.provision_environment, env_id, sync_sessions,
+            "provision", boom, retries=0,
+        )
+
+    assert _count(
+        "provision_total", template=TEMPLATE, outcome=Outcome.RETRY
+    ) == before + 1
+    # A transient error that will be tried again must not read as a lost
+    # environment — this is the whole reason `retry` is a separate outcome.
+    assert _count(
+        "provision_total", template=TEMPLATE, outcome=Outcome.FAILURE
+    ) == before_failed
+
+
+def test_provision_failure_when_exhausted_counts_as_failure(sync_sessions):
+    env_id = _make_env(sync_sessions, "doomed-env")
+    before = _count("provision_total", template=TEMPLATE, outcome=Outcome.FAILURE)
+    before_timed = _duration_count(TEMPLATE)
+
+    def boom(**_kw):
+        raise RuntimeError("docker daemon unreachable")
+
+    task = worker_tasks.provision_environment
+    with pytest.raises(Exception):
+        _run_task(task, env_id, sync_sessions, "provision", boom,
+                  retries=task.max_retries)
+
+    assert _count(
+        "provision_total", template=TEMPLATE, outcome=Outcome.FAILURE
+    ) == before + 1
+    # A failed provision must never land in the duration histogram: its
+    # distribution is unrelated, and mixing them makes the percentiles describe
+    # neither population.
+    assert _duration_count(TEMPLATE) == before_timed
+
+
+def test_provision_failure_before_the_row_is_read_uses_the_sentinel(sync_sessions):
+    """
+    A missing row means the template is genuinely unknown. The series still has
+    to be labelled — an empty label value is a third meaning nobody reads.
+    """
+    missing = "3f1a0c22-0000-4000-8000-000000000000"
+    before = _count(
+        "provision_total", template=UNKNOWN_TEMPLATE, outcome=Outcome.FAILURE
+    )
+
+    with pytest.raises(ValueError):
+        _run_task(
+            worker_tasks.provision_environment, missing, sync_sessions,
+            "provision", lambda **kw: _stack(),
+        )
+
+    assert _count(
+        "provision_total", template=UNKNOWN_TEMPLATE, outcome=Outcome.FAILURE
+    ) == before + 1
+
+
+def test_teardown_success_counts(sync_sessions):
+    env_id = _make_env(sync_sessions, "bye-env")
+    before = _count("teardown_total", outcome=Outcome.SUCCESS)
+
+    _run_task(
+        worker_tasks.teardown_environment, env_id, sync_sessions,
+        "teardown", lambda **kw: None,
+    )
+
+    assert _count("teardown_total", outcome=Outcome.SUCCESS) == before + 1
+
+
+def test_teardown_exhausted_counts_as_failure(sync_sessions):
+    env_id = _make_env(sync_sessions, "stuck-env")
+    before = _count("teardown_total", outcome=Outcome.FAILURE)
+
+    def boom(**_kw):
+        raise RuntimeError("docker daemon unreachable")
+
+    task = worker_tasks.teardown_environment
+    with pytest.raises(RuntimeError):
+        _run_task(task, env_id, sync_sessions, "teardown", boom,
+                  retries=task.max_retries)
+
+    assert _count("teardown_total", outcome=Outcome.FAILURE) == before + 1
+
+
+def test_running_a_task_twice_counts_twice(sync_sessions):
+    """
+    Deliberately *not* the idempotency assertion its neighbours in
+    test_environments.py make.
+
+    Provisioning twice must be a no-op against Docker and the database
+    (invariant 2), but the counter has to move both times. `task_acks_late` makes
+    redelivery normal, and a counter that skipped the second attempt would stop
+    measuring load — which is the only thing it is for. The two properties are
+    not in conflict; they are about different subjects.
+    """
+    env_id = _make_env(sync_sessions, "twice-env")
+    before = _count("provision_total", template=TEMPLATE, outcome=Outcome.SUCCESS)
+
+    for _ in range(2):
+        _run_task(
+            worker_tasks.provision_environment, env_id, sync_sessions,
+            "provision", lambda **kw: _stack(),
+        )
+
+    assert _count(
+        "provision_total", template=TEMPLATE, outcome=Outcome.SUCCESS
+    ) == before + 2

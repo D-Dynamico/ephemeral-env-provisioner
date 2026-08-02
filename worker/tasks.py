@@ -5,6 +5,7 @@ Run with:
     celery -A worker.tasks worker --loglevel=info
 """
 
+import time
 import uuid
 from datetime import datetime, timezone, timedelta
 
@@ -16,6 +17,13 @@ from sqlalchemy.orm import Session, sessionmaker
 from config import settings
 from db.models import Environment, EnvironmentStatus
 from docker_manager.compose import docker_manager
+from metrics import (
+    UNKNOWN_TEMPLATE,
+    Outcome,
+    provision_duration_seconds,
+    provision_total,
+    teardown_total,
+)
 from observability import bind_env_id, configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -112,6 +120,16 @@ def provision_environment(self, env_id: str) -> dict:
     Updates environment status in the DB as it progresses.
     """
     db = get_sync_db()
+    # Metrics are counted per *attempt*, so the clock starts here rather than at
+    # the row's created_at: this measures the provision, not the time the task
+    # spent queued behind other work. Queue wait is a real number worth having
+    # and it is a different metric — merged into one histogram, the result moves
+    # for two unrelated reasons and can be read for neither.
+    started = time.monotonic()
+    # Stands in until the row is read, so a failure before that still counts
+    # against a closed label set instead of an empty one.
+    template = UNKNOWN_TEMPLATE
+
     # Everything below — including lines from docker_manager — is tagged with
     # this env_id, so one provision is a filter rather than a grep.
     with bind_env_id(env_id):
@@ -119,6 +137,7 @@ def provision_environment(self, env_id: str) -> dict:
             env: Environment = _load_env(db, env_id)
             if not env:
                 raise ValueError(f"Environment {env_id} not found")
+            template = env.template
 
             # ── Transition: pending → provisioning ─────────────────────────────
             env.set_status(EnvironmentStatus.PROVISIONING)
@@ -141,6 +160,16 @@ def provision_environment(self, env_id: str) -> dict:
             env.expires_at = now + timedelta(seconds=env.ttl_seconds)
             db.commit()
 
+            provision_total.labels(
+                template=template, outcome=Outcome.SUCCESS
+            ).inc()
+            # Successes only. A provision that dies at 3s and one that succeeds
+            # at 11s are different distributions, and mixing them makes the
+            # percentiles describe neither. Failures are already counted above.
+            provision_duration_seconds.labels(template=template).observe(
+                time.monotonic() - started
+            )
+
             log.info(
                 "provision.running",
                 template=env.template,
@@ -158,8 +187,21 @@ def provision_environment(self, env_id: str) -> dict:
             log.exception("provision.failed", error=str(exc))
             _mark_failed(db, env_id, str(exc))
 
+            # A ValueError is not retried, and neither is an attempt that has
+            # already used its budget. Both are the end of the road, so they
+            # count as `failure`; anything still due another attempt counts as
+            # `retry`. The check has to happen before self.retry(), which on the
+            # last attempt re-raises rather than returning.
+            retryable = not isinstance(exc, ValueError)
+            exhausted = self.request.retries >= self.max_retries
+            provision_total.labels(
+                template=template,
+                outcome=Outcome.RETRY if retryable and not exhausted
+                else Outcome.FAILURE,
+            ).inc()
+
             # Retry with exponential backoff unless it's a value error
-            if not isinstance(exc, ValueError):
+            if retryable:
                 raise self.retry(exc=exc, countdown=2 ** self.request.retries * 10)
             raise
 
@@ -195,6 +237,7 @@ def teardown_environment(self, env_id: str) -> dict:
             env.stopped_at = datetime.now(timezone.utc)
             db.commit()
 
+            teardown_total.labels(outcome=Outcome.SUCCESS).inc()
             log.info("teardown.complete")
             return {"env_id": env_id, "status": "stopped"}
 
@@ -204,7 +247,12 @@ def teardown_environment(self, env_id: str) -> dict:
             )
             # self.retry() raises out of this block, so the exhaustion check has to
             # happen before the call — it cannot be caught by the same try.
-            if self.request.retries >= self.max_retries:
+            exhausted = self.request.retries >= self.max_retries
+            teardown_total.labels(
+                outcome=Outcome.FAILURE if exhausted else Outcome.RETRY
+            ).inc()
+
+            if exhausted:
                 # Last attempt. Without this the row sits in STOPPING forever with
                 # no task left to move it, and the reaper only scans RUNNING.
                 _mark_failed(db, env_id, f"Teardown failed: {exc}")
